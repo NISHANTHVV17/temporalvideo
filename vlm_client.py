@@ -10,6 +10,10 @@ import re
 from pathlib import Path
 from typing import Any, Protocol
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).with_name(".env"), override=False)
+
 
 class VLMClient(Protocol):
     def answer(self, question: str, context: dict[str, Any], video_path: str,
@@ -19,18 +23,34 @@ class VLMClient(Protocol):
 
 
 class HostedOpenAIClient:
-    def __init__(self, model: str | None = None, max_payload_bytes: int = 8_000_000):
-        self.api_key = os.getenv("OPENAI_API_KEY")
-        self.model = model or os.getenv("TEMPORALVIDEO_VLM_MODEL", "gpt-4o-mini")
+    def __init__(self, model: str | None = None, max_payload_bytes: int = 8_000_000,
+                 provider: str | None = None):
+        self.provider = provider or ("nvidia" if os.getenv("NVIDIA_VIDEO_API_KEY") else "openai")
+        if self.provider == "nvidia":
+            self.api_key = os.getenv("NVIDIA_VIDEO_API_KEY")
+            default_model = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"
+            self.base_url = "https://integrate.api.nvidia.com/v1"
+        else:
+            self.api_key = os.getenv("OPENAI_API_KEY")
+            default_model = "gpt-4o-mini"
+            self.base_url = None
+        self.model = model or os.getenv("TEMPORALVIDEO_VLM_MODEL", default_model)
         self.max_payload_bytes = max_payload_bytes
 
-    def plan(self, question: str) -> dict[str, Any]:
+    def _client(self):
         if not self.api_key:
-            raise RuntimeError("OPENAI_API_KEY is not configured")
+            variable = "NVIDIA_VIDEO_API_KEY" if self.provider == "nvidia" else "OPENAI_API_KEY"
+            raise RuntimeError(f"{variable} is not configured")
         try:
             from openai import OpenAI
         except ImportError as exc:
-            raise RuntimeError("Install optional package openai to enable hosted planning") from exc
+            raise RuntimeError("Install optional package openai to enable hosted VLM") from exc
+        options = {"api_key": self.api_key}
+        if self.base_url:
+            options["base_url"] = self.base_url
+        return OpenAI(**options)
+
+    def plan(self, question: str) -> dict[str, Any]:
         schema = {
             "type": "object",
             "properties": {
@@ -51,7 +71,7 @@ class HostedOpenAIClient:
                 "asks_causation": {"type": "boolean"}, "preceding_seconds": {"type": "number"}},
             "required": ["intent", "entities", "relations", "filters", "asks_causation", "preceding_seconds"],
             "additionalProperties": False}
-        response = OpenAI(api_key=self.api_key).chat.completions.create(
+        response = self._client().chat.completions.create(
             model=self.model,
             messages=[{"role": "system", "content": "Convert the video question into a generic evidence query plan. "
                       "Do not answer the question. Separate entities on either side of temporal relations. "
@@ -64,14 +84,8 @@ class HostedOpenAIClient:
 
     def answer(self, question: str, context: dict[str, Any], video_path: str,
                start: float, end: float) -> dict[str, Any]:
-        if not self.api_key:
-            raise RuntimeError("OPENAI_API_KEY is not configured")
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError("Install optional package openai to enable hosted VLM") from exc
         frame_data = self._frames(video_path, start, end)
-        client = OpenAI(api_key=self.api_key)
+        client = self._client()
         frame_times = ", ".join(f"{pts:.3f}" for pts, _ in frame_data)
         prompt = ("Answer only from these short video frames and structured evidence. "
                   "Do not claim causation; report temporal sequence. Return JSON with keys answer, "
@@ -217,8 +231,10 @@ def choose_vlm(prefer_local: bool = False, backend: str | None = None,
         selected = "local"
     if selected == "local":
         return LocalQwenClient(model_name or os.getenv("TEMPORALVIDEO_QWEN_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct"))
-    if selected == "hosted" and os.getenv("OPENAI_API_KEY"):
+    if selected == "nvidia" and os.getenv("NVIDIA_VIDEO_API_KEY"):
+        return HostedOpenAIClient(provider="nvidia")
+    if selected == "hosted" and (os.getenv("NVIDIA_VIDEO_API_KEY") or os.getenv("OPENAI_API_KEY")):
         return HostedOpenAIClient()
-    if selected == "auto" and os.getenv("OPENAI_API_KEY"):
+    if selected == "auto" and (os.getenv("NVIDIA_VIDEO_API_KEY") or os.getenv("OPENAI_API_KEY")):
         return HostedOpenAIClient()
     return None

@@ -386,6 +386,22 @@ def test_hosted_vlm_frames_retain_source_pts(tmp_path):
     assert all(isinstance(image, str) and image for _, image in frames)
 
 
+def test_nvidia_video_key_selects_nvidia_hosted_vlm(monkeypatch):
+    from vlm_client import HostedOpenAIClient, choose_vlm
+
+    monkeypatch.setenv("NVIDIA_VIDEO_API_KEY", "test-video-key")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("TEMPORALVIDEO_VLM_MODEL", raising=False)
+
+    client = choose_vlm()
+
+    assert isinstance(client, HostedOpenAIClient)
+    assert client.provider == "nvidia"
+    assert client.api_key == "test-video-key"
+    assert client.base_url == "https://integrate.api.nvidia.com/v1"
+    assert client.model == "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"
+
+
 def test_specific_sound_label_is_not_confident_from_onset_alone():
     database = EvidenceDB(":memory:")
     database.add_event({"event_id": "onset", "video_id": "synthetic", "track_id": None,

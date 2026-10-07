@@ -45,7 +45,8 @@ The base install does not download model weights. Optional integrations are inte
 - YOLO11/OpenVINO: install Ultralytics and use an existing compatible model file; OpenVINO export is requested with `tracking.backend: openvino`.
 - YOLO-World: loaded only for on-demand, question-conditioned detection in candidate windows; provide local weights with `TEMPORALVIDEO_YOLOWORLD_MODEL`.
 - CLIP: install `transformers` and `torch`, and ensure the configured model weights are already available locally. Automatic indexing does not download them.
-- Hosted VLM/planner: install `openai` and set `OPENAI_API_KEY` in the shell. The key is never stored in project files. The same client can produce the strict query plan and judge short candidate windows.
+- Hosted VLM/planner: install `openai` and set `NVIDIA_VIDEO_API_KEY` to use NVIDIA NIM (`https://integrate.api.nvidia.com/v1`) for video-window answering and planning. Keys may be placed in a project-local `.env` file, which is loaded automatically and ignored by Git. NVIDIA is selected automatically when this key is present; otherwise `OPENAI_API_KEY` remains supported. Set `TEMPORALVIDEO_VLM_MODEL` to override the provider's default model.
+- Semantic image/text grounding currently uses local CLIP so stored frame-image vectors and query-text vectors share the same embedding space. A text-only NVIDIA embedding key/model cannot replace that path without also changing frame embedding generation; `NVIDIA_EMBEDDING_API_KEY` is therefore not consumed by the current pipeline.
 - WebRTC VAD: install `webrtcvad`.
 
 If these are missing, temporal answers fall back to rule, motion, audio, and appearance evidence with confidence reduced where semantic judgment is required.
