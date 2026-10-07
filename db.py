@@ -141,7 +141,8 @@ class EvidenceDB:
                 )
         return log_path
 
-    def write_summary_log(self, video_id: str, summary: list[dict[str, str]]) -> Path:
+    def write_summary_log(self, video_id: str, summary: list[dict[str, Any]],
+                duration: float | None = None) -> Path:
         log_path = self.path.with_name(f"{video_id}.summary.txt")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("w", encoding="utf-8") as handle:
@@ -151,4 +152,7 @@ class EvidenceDB:
                 return log_path
             for item in summary:
                 handle.write(f"{item.get('time', '')}\t{item.get('event', '')}\n")
+            data_path = log_path.with_suffix(".json")
+            data_path.write_text(json.dumps({"video_duration": duration, "events": summary},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
         return log_path

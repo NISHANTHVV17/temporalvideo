@@ -36,6 +36,9 @@ def disable_remote_embeddings(monkeypatch):
     monkeypatch.setenv("TEMPORALVIDEO_EMBEDDING_BACKEND", "local")
     monkeypatch.delenv("NVIDIA_VIDEO_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_KEY", raising=False)
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
 
 
 def create_synthetic_video(directory: Path) -> tuple[Path, bool]:
@@ -142,6 +145,52 @@ def test_summary_output_path_matches_saved_artifact(tmp_path, monkeypatch):
 
     video_id = cli.file_sha256(video)[:20]
     assert cli.summary_output_path(video).name == f"{video_id}.summary.txt"
+
+
+def test_ask_video_answers_duration_from_saved_summary_only(tmp_path, monkeypatch):
+    import cli
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"same video identity")
+    video_id = cli.file_sha256(video)[:20]
+    config = {"indexing": {"database_dir": str(tmp_path / "db")}}
+    monkeypatch.setattr(cli, "read_config", lambda _path: config)
+    summary_path = cli.summary_output_path(video)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(
+        "Time\tEvent\n"
+        "0.00-3.00 s\tA white van is positioned on a wooden plank extending over muddy water.\n"
+        "3.00-6.50 s\tThe van tilts forward off the plank and falls toward the water.\n"
+        "6.50-9.90 s\tThe van splashes into the water and disappears beneath the surface.\n",
+        encoding="utf-8")
+    monkeypatch.setattr(cli, "index_video", lambda *_args, **_kwargs: pytest.fail(
+        "logs-only question answering must not re-index or upload the video"))
+    monkeypatch.setattr("vlm_client.TwelveLabsVideoSummaryClient", lambda *_args, **_kwargs: pytest.fail(
+        "logs-only question answering must not call TwelveLabs"))
+
+    answer = cli.ask_video(video, "how long the van normally in the ground without falling")
+
+    assert "approximately 3 seconds" in answer.answer
+    assert "cannot establish what normally happens" in answer.answer
+    assert (answer.t_start, answer.t_end) == (0.0, 3.0)
+    assert answer.timestamp_source == "rule"
+    assert answer.event_ids[0].startswith(f"summary-{video_id}-")
+
+
+def test_ask_video_refuses_question_absent_from_saved_summary(tmp_path, monkeypatch):
+    import cli
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"same video identity")
+    config = {"indexing": {"database_dir": str(tmp_path / "db")}}
+    monkeypatch.setattr(cli, "read_config", lambda _path: config)
+    summary_path = cli.summary_output_path(video)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text("Time\tEvent\n0.00-3.00 s\tA white van waits on a plank.\n",
+                            encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not contain enough information"):
+        cli.ask_video(video, "What color was the driver's jacket?")
 
 
 def test_summarize_video_requires_a_vlm(monkeypatch):
@@ -321,8 +370,16 @@ def test_twelvelabs_summary_sends_inline_video_and_parses_events(monkeypatch, tm
         captured["request"] = request
         captured["timeout"] = timeout
         return BytesIO(json.dumps({
-            "data": "0.00-2.80 | A white vehicle is positioned on a raised plank.\n"
-                    "2.80-6.50 | The vehicle tips forward and falls into the water.",
+            "data": json.dumps({"events": [
+                {"start_seconds": 0.0, "end_seconds": 2.8,
+                 "description": "A white vehicle is positioned on a raised plank.",
+                 "event_type": "stationary", "entities": ["white vehicle"],
+                 "location": "raised plank"},
+                {"start_seconds": 2.8, "end_seconds": 6.5,
+                 "description": "The vehicle tips forward and falls into the water.",
+                 "event_type": "fall", "entities": ["white vehicle"],
+                 "location": "water"},
+            ]}),
             "finish_reason": "stop",
         }).encode("utf-8"))
 
@@ -339,10 +396,15 @@ def test_twelvelabs_summary_sends_inline_video_and_parses_events(monkeypatch, tm
         "base64_string": base64.b64encode(video_bytes).decode("ascii"),
     }
     assert body["stream"] is False
-    assert "List the notable events with approximate timestamps" in body["prompt"]
+    assert "preserve separate repeated events" in body["prompt"]
+    assert body["response_format"]["type"] == "json_schema"
     assert result == [
-        {"time": "0.00-2.80 s", "event": "A white vehicle is positioned on a raised plank."},
-        {"time": "2.80-6.50 s", "event": "The vehicle tips forward and falls into the water."},
+        {"time": "0.00-2.80 s", "event": "A white vehicle is positioned on a raised plank.",
+         "start_seconds": 0.0, "end_seconds": 2.8, "event_type": "stationary",
+         "entities": ["white vehicle"], "location": "raised plank"},
+        {"time": "2.80-6.50 s", "event": "The vehicle tips forward and falls into the water.",
+         "start_seconds": 2.8, "end_seconds": 6.5, "event_type": "fall",
+         "entities": ["white vehicle"], "location": "water"},
     ]
 
 
@@ -371,47 +433,28 @@ def test_twelvelabs_answer_question_validates_structured_timestamps(monkeypatch,
     assert result == answer_data
 
 
-def test_ask_video_uses_twelvelabs_and_persists_answer_evidence(tmp_path, monkeypatch):
+def test_ask_video_answers_event_question_from_saved_summary_only(tmp_path, monkeypatch):
     import cli
 
-    video_id = "question-video"
-    database_path = tmp_path / f"{video_id}.sqlite3"
-    database = EvidenceDB(database_path)
-    database.add_video(video_id, "clip.mp4", "sha", 10.0, 640, 360)
-    database.close()
-    result = {
-        "answer": "The van was on the plank for about 3 seconds before it began to fall.",
-        "timestamp_start": 0.0,
-        "timestamp_end": 3.0,
-        "confidence": 0.9,
-        "uncertainty_seconds": 0.5,
-    }
-    called = []
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"analyzed video bytes")
+    config = {"indexing": {"database_dir": str(tmp_path / "db")}}
+    monkeypatch.setattr(cli, "read_config", lambda _path: config)
+    timeline_path = cli.summary_output_path(video)
+    timeline_path.parent.mkdir(parents=True, exist_ok=True)
+    timeline_path.write_text(
+        "Time\tEvent\n"
+        "0.00-3.00 s\tA white van is positioned on a wooden plank over water.\n"
+        "3.00-6.50 s\tThe van tilts forward off the plank and falls into the water.\n",
+        encoding="utf-8")
+    monkeypatch.setattr(cli, "index_video", lambda *_args, **_kwargs: pytest.fail(
+        "asking a question must not re-index or upload the video"))
 
-    class FakeTwelveLabs:
-        def __init__(self, model):
-            assert model == "pegasus1.6"
+    answer = cli.ask_video(video, "When does the van begin tipping forward?")
 
-        def answer_question(self, video_path, question, duration):
-            called.append((video_path, question, duration))
-            return result
-
-    monkeypatch.setattr(cli, "read_config", lambda _path: {
-        "vlm": {"qa_backend": "twelvelabs", "twelvelabs_model": "pegasus1.6"}})
-    monkeypatch.setattr(cli, "index_video", lambda *_args, **_kwargs: (video_id, database_path))
-    monkeypatch.setattr("vlm_client.TwelveLabsVideoSummaryClient", FakeTwelveLabs)
-
-    answer = cli.ask_video("clip.mp4", "How long was the van on the plank before falling?")
-    stored = EvidenceDB(database_path)
-    event = stored.rows("SELECT * FROM events WHERE event_id=?", (answer.event_ids[0],))[0]
-
-    assert called and called[0][1] == "How long was the van on the plank before falling?"
-    assert answer.answer == result["answer"]
-    assert (answer.t_start, answer.t_end) == (0.0, 3.0)
-    assert answer.timestamp_source == "vlm"
-    assert answer.confidence == 0.9
-    assert event["event_type"] == "twelvelabs_answer_evidence"
-    stored.close()
+    assert "tilts forward" in answer.answer
+    assert (answer.t_start, answer.t_end) == (3.0, 6.5)
+    assert answer.timestamp_source == "rule"
 
 
 def test_answer_requires_timestamp_and_formats_long_video():
@@ -730,6 +773,46 @@ def test_count_answer_reports_each_occurrence_timestamp():
     assert "00:02" in answer
     assert "00:07" in answer
     database.close()
+
+
+def test_count_and_duration_question_wording_resolves_indexed_events():
+    database = EvidenceDB(":memory:")
+    executor = QueryExecutor(database, "synthetic", "unused.mp4", 150.0, ".")
+    for event_id, start in (("stop-1", 10.0), ("stop-2", 40.0)):
+        database.add_event({"event_id": event_id, "video_id": "synthetic",
+                            "track_id": "machine-1", "class": "machine",
+                            "event_type": "motion_stop", "t_start": start,
+                            "t_end": start + 0.5, "zone": None, "confidence": 0.8,
+                            "meta_json": "{}"})
+    database.add_event({"event_id": "object-stationary", "video_id": "synthetic",
+                        "track_id": "object-1", "class": "object",
+                        "event_type": "stationary", "t_start": 0.0, "t_end": 130.0,
+                        "zone": None, "confidence": 0.8, "meta_json": "{}"})
+
+    count_answer = executor.ask("How many times did the machine stop unexpectedly?")
+    duration_answer = executor.ask(
+        "Find every object that sat there untouched for more than 2 minutes.")
+
+    assert "Observed 2 matching event(s)" in count_answer.answer
+    assert set(count_answer.event_ids) == {"stop-1", "stop-2"}
+    assert "object-1" in duration_answer.answer
+    assert duration_answer.event_ids == ["object-stationary"]
+    database.close()
+
+
+def test_saved_log_generic_count_reports_one_matching_event():
+    import cli
+
+    entries = [{"start": 2.0, "end": 6.0, "description":
+                "The white minivan begins to tilt forward off the edge and falls toward the water.",
+                "event_type": "fall", "entities": ["white minivan"], "location": "water",
+                "event_id": "summary-fall-1"}]
+    answer = cli._answer_structured_log_query(
+        "How many times did the car fall?", entries, "video", 10.0)
+
+    assert answer is not None
+    assert "records 1 matching event" in answer.answer
+    assert answer.event_ids == ["summary-fall-1"]
 
 
 def test_exhaustive_vlm_search_visits_late_video_buckets():

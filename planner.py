@@ -104,10 +104,15 @@ def _extract_entities(question: str) -> list[EntitySpec]:
     for phrase in phrases[:4]:
         kind = (EntityKind.sound if any(token in phrase for token in ("alarm", "sound", "beep", "speech", "noise"))
                 else EntityKind.person if "person" in phrase or "who" in phrase or phrase.startswith("which person")
+            else EntityKind.object if any(token in phrase for token in
+                                          ("object", "truck", "machine", "vehicle", "box", "car"))
             else EntityKind.action)
         class_hint = None
         if kind == EntityKind.person:
             class_hint = "person"
+        elif kind == EntityKind.object:
+            class_hint = next((token for token in ("truck", "machine", "vehicle", "box", "car")
+                               if token in phrase), None)
         elif kind == EntityKind.sound:
             class_hint = phrase
         entities.append(EntitySpec(phrase=phrase, kind=kind,

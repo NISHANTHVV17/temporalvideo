@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import sys
 import time
 import uuid
@@ -260,69 +261,330 @@ def _run_global_reid(db: EvidenceDB, video_id: str, config: dict[str, Any]):
 
 def ask_video(video_path: str | Path, question: str, config_path: str | Path | None = None,
               zone_path: str | Path | None = None) -> Answer:
+    video_path = Path(video_path).resolve()
+    video_id = file_sha256(video_path)[:20]
     config = read_config(config_path)
-    video_id, db_path = index_video(video_path, config_path, zone_path=zone_path)
-    db = EvidenceDB(db_path)
+    timeline_path = summary_output_path(video_path, config_path)
+    if not timeline_path.is_file():
+        raise FileNotFoundError(
+            f"No analyzed event summary exists for this video. Analyze it first; expected {timeline_path}")
+    data_path = summary_data_path(video_path, config_path)
+    entries, duration = _read_summary_evidence(timeline_path, data_path, video_id)
+    if not entries:
+        raise ValueError("The saved summary has no timestamped events to answer from")
+    duration = max(duration, max(entry["end"] for entry in entries))
+    llm_answer = _answer_from_log_llm(question, entries, duration)
+    if llm_answer is not None:
+        return llm_answer
+    structured_answer = _answer_structured_log_query(question, entries, video_id, duration)
+    if structured_answer is not None:
+        return structured_answer
+    question_lower = question.lower()
+    if re.search(r"\bhow long\b|\bduration\b|\bfor how much time\b", question_lower):
+        pre_fall_question = bool(re.search(r"\b(before|until|prior to|without)\b", question_lower)
+                                 or re.search(r"\bon (?:the )?plank\b", question_lower))
+        fall_index = next((index for index, entry in enumerate(entries)
+                           if re.search(r"\b(fall|falls|falling|fell|drop|dropped|tip|tipping)\b",
+                                        entry["description"].lower())), None)
+        if pre_fall_question and fall_index is not None and fall_index > 0:
+            prior = entries[fall_index - 1]
+            fall_event = entries[fall_index]
+            duration_seconds = max(0.0, fall_event["start"] - prior["start"])
+            if duration_seconds > 0:
+                answer_text = (
+                    f"In this clip, {prior['description'].rstrip('.')} for approximately "
+                    f"{duration_seconds:g} seconds before the fall begins. "
+                    "One video cannot establish what normally happens."
+                )
+                return Answer(
+                    answer=answer_text, t_start=prior["start"], t_end=fall_event["start"],
+                    event_ids=[prior["event_id"], fall_event["event_id"]],
+                    confidence=0.8, video_duration=duration, timestamp_source="rule",
+                    uncertainty_seconds=max(0.5, (prior["end"] - prior["start"]) * 0.15),
+                )
+        query_words = _log_query_words(question_lower)
+        target = _best_log_entry(query_words, entries)
+        elapsed = target["end"] - target["start"]
+        return Answer(
+            answer=f"According to the analyzed log, {target['description']} This interval lasts approximately {elapsed:g} seconds.",
+            t_start=target["start"], t_end=target["end"], event_ids=[target["event_id"]],
+            confidence=0.65, video_duration=duration, timestamp_source="rule",
+            uncertainty_seconds=max(0.5, elapsed * 0.15),
+        )
+    query_words = _log_query_words(question_lower)
+    target = _best_log_entry(query_words, entries)
+    return Answer(
+        answer=f"According to the analyzed log, {target['description']}",
+        t_start=target["start"], t_end=target["end"], event_ids=[target["event_id"]],
+        confidence=0.65, video_duration=duration, timestamp_source="rule",
+        uncertainty_seconds=max(0.5, (target["end"] - target["start"]) * 0.15),
+    )
+
+
+def _answer_from_log_llm(question: str, entries: list[dict[str, Any]],
+                         duration: float) -> Answer | None:
     try:
-        row = db.rows("SELECT duration FROM videos WHERE video_id=?", (video_id,))[0]
-        vlm_config = config.get("vlm", {})
-        qa_backend = vlm_config.get("qa_backend", "twelvelabs")
-        if qa_backend == "twelvelabs":
-            from vlm_client import TwelveLabsVideoSummaryClient
-            model = vlm_config.get("twelvelabs_model", "pegasus1.6")
-            result = TwelveLabsVideoSummaryClient(model).answer_question(
-                str(Path(video_path).resolve()), question, float(row["duration"]))
-            event_id = uuid.uuid4().hex
-            db.add_event({
-                "event_id": event_id,
-                "video_id": video_id,
-                "track_id": None,
-                "class": "scene",
-                "event_type": "twelvelabs_answer_evidence",
-                "t_start": result["timestamp_start"],
-                "t_end": result["timestamp_end"],
-                "zone": None,
-                "confidence": result["confidence"],
-                "meta_json": json.dumps({"question": question, "answer": result["answer"],
-                                          "model": model}),
+        from vlm_client import choose_log_llm
+        client = choose_log_llm()
+        if client is None or not hasattr(client, "answer_log"):
+            return None
+        result = client.answer_log(question, entries, duration)
+        return Answer(answer=str(result["answer"]),
+                      t_start=float(result["timestamp_start"]),
+                      t_end=float(result["timestamp_end"]),
+                      event_ids=[str(event_id) for event_id in result["event_ids"]],
+                      confidence=float(result["confidence"]), video_duration=duration,
+                      timestamp_source="vlm",
+                      uncertainty_seconds=float(result["uncertainty_seconds"]))
+    except Exception:
+        logging.warning("Log-grounded LLM answer unavailable; using deterministic fallback",
+                        exc_info=True)
+        return None
+
+
+def _read_summary_evidence(timeline_path: Path, data_path: Path,
+                           video_id: str) -> tuple[list[dict[str, Any]], float]:
+    entries: list[dict[str, Any]] = []
+    duration = 0.0
+    if data_path.is_file():
+        payload = json.loads(data_path.read_text(encoding="utf-8"))
+        duration = float(payload.get("video_duration") or 0.0)
+        raw_events = payload.get("events", [])
+        for index, event in enumerate(raw_events):
+            if not isinstance(event, dict):
+                continue
+            try:
+                start = float(event.get("start_seconds"))
+                end = float(event.get("end_seconds"))
+            except (TypeError, ValueError):
+                time_match = re.fullmatch(
+                    r"\s*(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\s*s\s*", str(event.get("time", "")))
+                if not time_match:
+                    continue
+                start, end = float(time_match.group(1)), float(time_match.group(2))
+            if start < 0 or end <= start:
+                continue
+            entities = event.get("entities", [])
+            if not isinstance(entities, list):
+                entities = [str(entities)] if entities else []
+            entries.append({
+                "index": index,
+                "start": start,
+                "end": end,
+                "description": str(event.get("event") or event.get("description") or "").strip(),
+                "event_type": str(event.get("event_type") or "event").lower().replace(" ", "_"),
+                "entities": [str(entity).strip() for entity in entities if str(entity).strip()],
+                "location": str(event.get("location") or "").strip(),
+                "event_id": str(event.get("event_id") or f"summary-{video_id}-{index}"),
             })
-            db.write_event_log(video_id)
-            return Answer(
-                answer=result["answer"],
-                t_start=result["timestamp_start"],
-                t_end=result["timestamp_end"],
-                event_ids=[event_id],
-                confidence=result["confidence"],
-                low_confidence=result["confidence"] < 0.35,
-                video_duration=float(row["duration"]),
-                timestamp_source="vlm",
-                uncertainty_seconds=result["uncertainty_seconds"],
-            )
-        tracks = db.rows("SELECT * FROM tracks WHERE video_id=?", (video_id,))
-        merges = merge_tracks([{"track_id": item["track_id"], "class": item["class"],
-                                "shot_id": item["shot_id"], "t_start": item["t_start"],
-                                "t_end": item["t_end"],
-                                "embedding": json.loads(item["embedding_json"] or "null")}
-                               for item in tracks],
-                              float(config["reid"]["merge_similarity"]),
-                              float(config["reid"]["max_exit_reentry_seconds"]))
-        from executor import QueryExecutor
-        from vlm_client import choose_vlm
-        backend = vlm_config.get("backend", "auto")
-        vlm = choose_vlm(backend=backend,
-                 model_name=vlm_config.get("local_model") if backend == "local" else None)
-        answer = QueryExecutor(db, video_id, video_path, float(row["duration"]),
-                               _project_path(config["indexing"]["cache_dir"]), merges, vlm=vlm,
-                               before_after_seconds=float(config["query"]["before_after_seconds"]),
-                               semantic_provider=config.get("semantic", {}).get("provider")).ask(question)
-        return answer
-    finally:
-        db.close()
+        return entries, duration
+
+    for index, line in enumerate(timeline_path.read_text(encoding="utf-8").splitlines()):
+        columns = line.split("\t", 1)
+        if len(columns) != 2:
+            continue
+        match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)\s*s\s*", columns[0])
+        if match is None:
+            continue
+        start, end = float(match.group(1)), float(match.group(2))
+        if end <= start:
+            continue
+        entries.append({"index": index, "start": start, "end": end,
+                        "description": columns[1].strip(), "event_type": "event",
+                        "entities": [], "location": "",
+                        "event_id": f"summary-{video_id}-{index}"})
+    return entries, max((entry["end"] for entry in entries), default=0.0)
+
+
+def _answer_structured_log_query(question: str, entries: list[dict[str, Any]],
+                                 video_id: str, duration: float) -> Answer | None:
+    lowered = question.lower()
+    entities_text = lambda entry: " ".join(entry["entities"])
+    combined = lambda entry: f"{entry['event_type']} {entry['description']} {entities_text(entry)} {entry['location']}".lower()
+
+    if (re.search(r"\bwhich\b", lowered) and re.search(r"\b(person|who)\b", lowered)
+            and re.search(r"\b(enter|entered|enters)\b", lowered)
+            and re.search(r"\bafter\b", lowered)
+            and re.search(r"\b(arriv|arrived|arrival)\b", lowered)):
+        truck_terms = {word for word in _log_query_words(lowered) if word not in {"person", "enter", "area"}}
+        arrivals = [entry for entry in entries
+                    if re.search(r"arriv|arrives|arrived|arrival", combined(entry))
+                    and (not truck_terms or truck_terms & _normalized_words(combined(entry)))]
+        area_terms = {word for word in _log_query_words(lowered)
+                      if word not in {"person", "enter", "arriv", "truck", "delivery"}}
+        entries_into_area = [entry for entry in entries
+                             if (entry["event_type"] in {"zone_entry", "area_entry", "entry"}
+                                 or re.search(r"\b(enter|entered|enters)\b", combined(entry)))
+                             and re.search(r"person|human", combined(entry))]
+        if area_terms:
+            entries_into_area = [entry for entry in entries_into_area
+                                 if area_terms & _normalized_words(combined(entry))]
+        if not arrivals or not entries_into_area:
+            raise ValueError("The saved event log does not record both the truck arrival and a person's area entry")
+        arrival = min(arrivals, key=lambda item: item["start"])
+        later_entries = [entry for entry in entries_into_area if entry["start"] >= arrival["start"]]
+        if not later_entries:
+            raise ValueError("The saved event log does not show a person entering after the truck arrived")
+        entry = min(later_entries, key=lambda item: item["start"])
+        person = next((entity for entity in entry["entities"]
+                       if re.search(r"person|human", entity, re.I)), "the person recorded in the log")
+        area = entry["location"] or "the area named in the event log"
+        return _make_log_answer(
+            f"The saved log identifies {person} entering {area} after the delivery truck arrived.",
+            [arrival, entry], video_id, duration, confidence=0.8)
+
+    if re.search(r"\bhow many\b", lowered) and re.search(r"\bstop|stopped|stops\b", lowered):
+        stops = [entry for entry in entries
+                 if (entry["event_type"] in {"stop", "machine_stop", "stopped"}
+                     or re.search(r"\b(stop|stops|stopped|stopping)\b", combined(entry)))]
+        machine_terms = {word for word in _log_query_words(lowered)
+                         if word not in {"machine", "unexpected", "unexpectedly", "times"}}
+        if machine_terms:
+            stops = [entry for entry in stops if machine_terms & _normalized_words(combined(entry))]
+        if not stops:
+            return _make_log_answer(
+                "The saved event log records no matching machine-stop events; it cannot establish whether unlogged stops occurred.",
+                entries, video_id, duration, confidence=0.45)
+        unexpectedly = "unexpected" in lowered
+        note = " The log does not establish whether they were unexpected." if unexpectedly else ""
+        return _make_log_answer(
+            f"The saved event log records {len(stops)} matching machine stop(s).{note}",
+            stops, video_id, duration, confidence=0.8 if not unexpectedly else 0.65)
+
+    if re.search(r"\bhow many\b|\bcount\b|\bnumber of\b", lowered):
+        query_terms = _log_query_words(lowered)
+        action_terms = query_terms & {
+            "fall", "fell", "drop", "dropped", "tip", "tipping", "enter", "entered",
+            "exit", "exited", "arrive", "arrived", "stop", "stopped", "start", "started",
+            "move", "moved", "appear", "appeared", "alarm", "sound"
+        }
+        matches = [entry for entry in entries
+                   if ((action_terms and action_terms & _normalized_words(combined(entry)))
+                       or (not action_terms and query_terms & _normalized_words(combined(entry))))]
+        if not matches:
+            return _make_log_answer(
+                "The saved event log records 0 matching events; it cannot establish whether unlogged events occurred.",
+                entries, video_id, duration, confidence=0.45)
+        return _make_log_answer(
+            f"The saved event log records {len(matches)} matching event(s).",
+            matches, video_id, duration, confidence=0.75)
+
+    if re.search(r"\bwhat happened\b", lowered) and re.search(r"\bright before\b", lowered) \
+            and re.search(r"\balarm\b", lowered):
+        alarms = [entry for entry in entries if re.search(r"alarm", combined(entry))]
+        if not alarms:
+            raise ValueError("The saved event log does not contain a safety-alarm event")
+        alarm = min(alarms, key=lambda item: item["start"])
+        preceding = [entry for entry in entries if entry["end"] <= alarm["start"]
+                     and entry["event_id"] != alarm["event_id"]]
+        if not preceding:
+            raise ValueError("The saved event log contains no recorded event before the alarm")
+        event = max(preceding, key=lambda item: item["end"])
+        return _make_log_answer(
+            f"Right before the safety alarm, the log records: {event['description']}",
+            [event, alarm], video_id, duration, confidence=0.8)
+
+    if re.search(r"\b(find|list)\b", lowered) and re.search(r"\b(untouched|stationary|sat)\b", lowered):
+        threshold = _stationary_threshold_seconds(lowered)
+        stationary = [entry for entry in entries
+                      if (entry["event_type"] in {"stationary", "untouched", "dwell"}
+                          or re.search(r"\b(stationary|untouched|sat|sits|remained still)\b", combined(entry)))
+                      and entry["end"] - entry["start"] > threshold]
+        objects = []
+        for entry in stationary:
+            people = [entity for entity in entry["entities"]
+                      if re.search(r"person|human|man|woman|child", entity, re.I)]
+            candidates = [entity for entity in entry["entities"] if entity not in people]
+            objects.extend(candidates)
+        objects = list(dict.fromkeys(objects))
+        if not objects:
+            return _make_log_answer(
+                f"The saved event log records no identified object stationary for more than {threshold:g} seconds. "
+                "This means none was recorded, not that none existed.",
+                stationary or entries, video_id, duration, confidence=0.5)
+        return _make_log_answer(
+            f"Objects recorded as stationary for more than {threshold:g} seconds: {', '.join(objects)}.",
+            stationary, video_id, duration, confidence=0.75)
+    return None
+
+
+def _stationary_threshold_seconds(question: str) -> float:
+    match = re.search(r"more than\s+(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b", question)
+    if not match:
+        return 0.0
+    amount = float(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("h"):
+        return amount * 3600
+    if unit.startswith("m"):
+        return amount * 60
+    return amount
+
+
+def _normalized_words(text: str) -> set[str]:
+    return {_normalize_log_word(word) for word in re.findall(r"[a-z0-9]+", text.lower())}
+
+
+def _make_log_answer(text: str, evidence: list[dict[str, Any]], video_id: str,
+                     duration: float, confidence: float) -> Answer:
+    if not evidence:
+        raise ValueError("The saved event log does not contain evidence for this answer")
+    start = min(entry["start"] for entry in evidence)
+    end = max(entry["end"] for entry in evidence)
+    if end <= start:
+        end = min(duration, start + 0.1)
+    if end <= start:
+        raise ValueError("The saved event interval is too short to provide a timestamp")
+    return Answer(
+        answer=text, t_start=start, t_end=end,
+        event_ids=list(dict.fromkeys(entry["event_id"] for entry in evidence)),
+        confidence=confidence, video_duration=duration, timestamp_source="rule",
+        uncertainty_seconds=max(0.5, (end - start) * 0.15),
+    )
+
+
+def _log_query_words(question: str) -> set[str]:
+    ignored = {"how", "long", "was", "were", "is", "are", "the", "a", "an", "in", "on",
+               "at", "to", "of", "for", "before", "after", "when", "what", "happened", "did",
+               "does", "do", "this", "that", "it", "normally", "usual", "usually", "without",
+               "during", "clip", "video", "show", "shown", "which", "who", "unexpected",
+               "unexpectedly", "times", "every", "there"}
+    return {_normalize_log_word(word) for word in re.findall(r"[a-z0-9]+", question)
+            if word not in ignored}
+
+
+def _normalize_log_word(word: str) -> str:
+    if len(word) > 5 and word.endswith("ing"):
+        return word[:-3]
+    if len(word) > 4 and word.endswith("ed"):
+        return word[:-2]
+    if len(word) > 4 and word.endswith("s"):
+        return word[:-1]
+    return word
+
+
+def _best_log_entry(query_words: set[str], entries: list[dict[str, Any]]) -> dict[str, Any]:
+    if not query_words:
+        raise ValueError("Ask a question that refers to an event described in the analyzed log")
+    ranked = []
+    for entry in entries:
+        event_words = {_normalize_log_word(word)
+                   for word in re.findall(r"[a-z0-9]+", entry["description"].lower())}
+        overlap = query_words & event_words
+        ranked.append((len(overlap) / len(query_words), len(overlap), entry))
+    score, overlap, entry = max(ranked, key=lambda item: (item[0], item[1]))
+    if overlap == 0 or score < 0.25:
+        raise ValueError("The saved event log does not contain enough information to answer that question")
+    return entry
 
 
 def summary_output_path(video_path: str | Path, config_path: str | Path | None = None) -> Path:
     video_id = file_sha256(Path(video_path).resolve())[:20]
     return _db_path(read_config(config_path), video_id).with_name(f"{video_id}.summary.txt")
+
+
+def summary_data_path(video_path: str | Path, config_path: str | Path | None = None) -> Path:
+    return summary_output_path(video_path, config_path).with_suffix(".json")
 
 
 def summarize_video(video_path: str | Path, config_path: str | Path | None = None,
@@ -343,7 +605,7 @@ def summarize_video(video_path: str | Path, config_path: str | Path | None = Non
     try:
         video = db.rows("SELECT duration FROM videos WHERE video_id=?", (video_id,))[0]
         summary = vlm.summarize(str(Path(video_path).resolve()), float(video["duration"]))
-        summary_path = db.write_summary_log(video_id, summary)
+        summary_path = db.write_summary_log(video_id, summary, float(video["duration"]))
         print(f"Saved summary to {summary_path}")
         return summary
     finally:

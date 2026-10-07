@@ -22,6 +22,9 @@ class VLMClient(Protocol):
     def answer(self, question: str, context: dict[str, Any], video_path: str,
                start: float, end: float) -> dict[str, Any]: ...
 
+    def answer_log(self, question: str, entries: list[dict[str, Any]],
+                   duration: float) -> dict[str, Any]: ...
+
     def plan(self, question: str) -> dict[str, Any]: ...
 
     def summarize(self, video_path: str, duration: float) -> list[dict[str, str]]: ...
@@ -204,6 +207,45 @@ def _parse_timestamped_event_lines(content: str, duration: float) -> list[dict[s
     return sorted(parsed, key=lambda item: float(item["time"].split("-", 1)[0]))
 
 
+def _parse_twelvelabs_event_json(content: str, duration: float) -> list[dict[str, Any]]:
+    result = _parse_json_response(content)
+    raw_events = result.get("events")
+    if not isinstance(raw_events, list):
+        raise ValueError("TwelveLabs response must include an events array")
+    events = []
+    for item in raw_events:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = float(item["start_seconds"])
+            end = float(item["end_seconds"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        description = str(item.get("description") or "").strip()
+        if (not description or not math.isfinite(start) or not math.isfinite(end)
+                or start < 0 or end <= start or end > duration + 1):
+            continue
+        start, end = min(start, duration), min(end, duration)
+        entities = item.get("entities")
+        if not isinstance(entities, list):
+            entities = []
+        entities = [str(entity).strip() for entity in entities if str(entity).strip()]
+        event_type = str(item.get("event_type") or "event").strip().lower().replace(" ", "_")
+        location = str(item.get("location") or "").strip()
+        events.append({
+            "time": f"{start:.2f}-{end:.2f} s",
+            "event": description,
+            "start_seconds": start,
+            "end_seconds": end,
+            "event_type": event_type,
+            "entities": entities,
+            "location": location,
+        })
+    if raw_events and not events:
+        raise ValueError("TwelveLabs returned no valid timestamped events")
+    return sorted(events, key=lambda event: (event["start_seconds"], event["end_seconds"]))
+
+
 class TwelveLabsVideoSummaryClient:
     def __init__(self, model: str = "pegasus1.6"):
         self.api_key = os.getenv("TWELVELABS_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
@@ -216,12 +258,30 @@ class TwelveLabsVideoSummaryClient:
         if len(video_bytes) > 30 * 1024 * 1024:
             raise ValueError("TwelveLabs inline video input must be 30 MB or smaller")
         prompt = (
-            "List the notable events with approximate timestamps. Return the events in chronological "
-            "order, one per line as start_seconds-end_seconds | description. Use decimal seconds from "
-            "the start of the video. Describe only events supported by this video; qualify uncertain "
-            "details and do not infer causes. The video is approximately "
-            f"{duration:.3f} seconds long."
+            "Create a detailed evidence log of events visible or audible in this video, in chronological "
+            "order. Do not limit the output to only the most notable events: preserve separate repeated "
+            "events and intervals needed to answer later questions about people, objects, arrivals, area "
+            "entries/exits, machine starts/stops, alarms, and stationary objects. For every event provide "
+            "start_seconds and end_seconds from the beginning of the clip, a concise description, an "
+            "event_type (for example arrival, zone_entry, zone_exit, stop, alarm, stationary, movement, "
+            "or other), entities as visible names or distinguishing descriptions (never invent identities), "
+            "and a location when visible. Include stop and stationary intervals only when supported by "
+            "observed duration. Do not infer intent, causation, or that an object was untouched when "
+            "occlusion prevents verifying it. The clip is approximately "
+            f"{duration:.3f} seconds long. Return only the requested JSON."
         )
+        event_schema = {
+            "type": "object",
+            "properties": {
+                "start_seconds": {"type": "number"},
+                "end_seconds": {"type": "number"},
+                "description": {"type": "string"},
+                "event_type": {"type": "string"},
+                "entities": {"type": "array", "items": {"type": "string"}},
+                "location": {"type": "string"},
+            },
+            "required": ["start_seconds", "end_seconds", "description", "event_type", "entities", "location"],
+        }
         request_body = {
             "model_name": self.model,
             "video": {
@@ -231,7 +291,15 @@ class TwelveLabsVideoSummaryClient:
             "prompt": prompt,
             "stream": False,
             "temperature": 0.2,
-            "max_tokens": 2048,
+            "max_tokens": 4096,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {"events": {"type": "array", "items": event_schema}},
+                    "required": ["events"],
+                },
+            },
         }
         request = urllib.request.Request(
             "https://api.twelvelabs.io/v1.3/analyze",
@@ -253,7 +321,7 @@ class TwelveLabsVideoSummaryClient:
         if result.get("finish_reason") == "length":
             raise RuntimeError("TwelveLabs summary was truncated; increase the output token limit")
         try:
-            return _parse_timestamped_event_lines(text, duration)
+            return _parse_twelvelabs_event_json(text, duration)
         except ValueError as exc:
             excerpt = text[:300].replace("\n", " ")
             raise RuntimeError(f"TwelveLabs returned invalid timestamped events: {exc}; response={excerpt!r}") from exc
@@ -362,11 +430,17 @@ def _merge_summary_events(events: list[dict[str, str]]) -> list[dict[str, str]]:
 class HostedOpenAIClient:
     def __init__(self, model: str | None = None, max_payload_bytes: int = 8_000_000,
                  provider: str | None = None):
-        self.provider = provider or ("nvidia" if os.getenv("NVIDIA_VIDEO_API_KEY") else "openai")
+        self.provider = provider or ("nvidia" if os.getenv("NVIDIA_VIDEO_API_KEY")
+                                     else "groq" if (os.getenv("GROQ_API_KEY") or os.getenv("GROQ_KEY"))
+                                     else "openai")
         if self.provider == "nvidia":
             self.api_key = os.getenv("NVIDIA_VIDEO_API_KEY")
             default_model = "nvidia/cosmos-reason2-8b"
             self.base_url = "https://integrate.api.nvidia.com/v1"
+        elif self.provider == "groq":
+            self.api_key = os.getenv("GROQ_API_KEY") or os.getenv("GROQ_KEY")
+            default_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+            self.base_url = "https://api.groq.com/openai/v1"
         else:
             self.api_key = os.getenv("OPENAI_API_KEY")
             default_model = "gpt-4o-mini"
@@ -376,7 +450,8 @@ class HostedOpenAIClient:
 
     def _client(self):
         if not self.api_key:
-            variable = "NVIDIA_VIDEO_API_KEY" if self.provider == "nvidia" else "OPENAI_API_KEY"
+            variable = ("NVIDIA_VIDEO_API_KEY" if self.provider == "nvidia"
+                        else "GROQ_API_KEY" if self.provider == "groq" else "OPENAI_API_KEY")
             raise RuntimeError(f"{variable} is not configured")
         try:
             from openai import OpenAI
@@ -522,6 +597,49 @@ class HostedOpenAIClient:
                     f"VLM returned an invalid summary for {start:.2f}-{end:.2f}s: "
                     f"{exc}; response={excerpt!r}") from exc
         return _merge_summary_events(events)
+
+    def answer_log(self, question: str, entries: list[dict[str, Any]],
+                   duration: float) -> dict[str, Any]:
+        client = self._client()
+        evidence = [{"event_id": entry["event_id"], "start": entry["start"],
+                     "end": entry["end"], "event_type": entry["event_type"],
+                     "description": entry["description"], "entities": entry["entities"],
+                     "location": entry["location"]} for entry in entries]
+        prompt = (
+            "Answer the question using only the timestamped analyzed event log below. "
+            "Do not invent events, identities, causes, or facts absent from the log. "
+            "For count questions, count matching log events, preserving separate repeated events. "
+            "For before/after questions, use the event timestamps. Return only JSON with answer, "
+            "timestamp_start, timestamp_end, confidence, uncertainty_seconds, and event_ids. "
+            "event_ids must be copied from the log. Timestamps must be absolute source-video seconds "
+            f"within 0 and {duration:.3f}. Question: {question}\n"
+            f"Analyzed event log: {json.dumps(evidence, ensure_ascii=True)}")
+        response = client.chat.completions.create(
+            model=self.model, response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}], max_tokens=700)
+        result = _parse_json_response(response.choices[0].message.content or "{}")
+        try:
+            start = float(result["timestamp_start"])
+            end = float(result["timestamp_end"])
+            raw_confidence = result["confidence"]
+            confidence = ({"very low": 0.2, "low": 0.3, "medium": 0.6,
+                           "high": 0.85, "very high": 0.95}.get(
+                               str(raw_confidence).strip().lower(), raw_confidence))
+            confidence = float(confidence)
+            uncertainty = float(result["uncertainty_seconds"])
+            text = str(result["answer"]).strip()
+            event_ids = [str(event_id) for event_id in result["event_ids"]]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("Hosted model returned an invalid log answer") from exc
+        valid_ids = {entry["event_id"] for entry in entries}
+        if (not text or not event_ids or not set(event_ids) <= valid_ids
+                or not all(math.isfinite(value) for value in (start, end, confidence, uncertainty))
+                or start < 0 or end <= start or end > duration or not 0 <= confidence <= 1
+                or uncertainty < 0):
+            raise RuntimeError("Hosted model log answer failed evidence validation")
+        return {"answer": text, "timestamp_start": start, "timestamp_end": end,
+                "confidence": confidence, "uncertainty_seconds": uncertainty,
+                "event_ids": event_ids}
 
     def _frames(self, video_path: str, start: float, end: float) -> list[tuple[float, str]]:
         import cv2
@@ -732,6 +850,13 @@ def choose_vlm(prefer_local: bool = False, backend: str | None = None,
         provider = "nvidia" if os.getenv("NVIDIA_VIDEO_API_KEY") else "openai"
         return HostedOpenAIClient(model=model_name, provider=provider)
     return None
+
+
+def choose_log_llm() -> HostedOpenAIClient | VLMClient | None:
+    """Choose a text-only client for answering from a saved event log."""
+    if os.getenv("GROQ_API_KEY") or os.getenv("GROQ_KEY"):
+        return HostedOpenAIClient(model=os.getenv("GROQ_MODEL"), provider="groq")
+    return choose_vlm()
 
 
 def choose_summary_client(backend: str, model_name: str | None = None):
