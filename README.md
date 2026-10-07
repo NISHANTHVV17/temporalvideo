@@ -1,0 +1,132 @@
+# TemporalVideoQA
+
+TemporalVideoQA builds a structured temporal index before answering natural-language questions. The CPU-first base uses PyAV PTS timestamps, OpenCV scene/motion analysis, SQLite evidence, and optional model backends. It does not send full videos to a VLM. Model-backed judgments operate only on short candidate windows.
+
+## Quick Start
+
+Requirements: Python 3.10+, FFmpeg available on `PATH` for audio extraction, and a CPU-capable OpenCV/PyAV install.
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python cli.py index /path/to/video.mp4
+python cli.py ask /path/to/video.mp4 "What happened right before the loud sound?"
+python cli.py eval ground_truth.json
+streamlit run app.py
+```
+
+The Streamlit UI accepts uploads up to 120 seconds, allows normalized zone polygons to be drawn or supplied as JSON, indexes the video, and plays the selected time window. Longer videos are supported through the CLI. The first index run is linear; later runs reuse an index keyed by SHA-256. A checkpoint is written during indexing. Resume replays decoded frames to restore tracker state, then persists from the last checkpoint; it favors deterministic continuity over fast seek and may therefore repeat decode work after interruption.
+
+## What Runs By Default
+
+- Ingestion samples at 3 FPS and scales the longest dimension to 640 pixels. Each sampled time comes from decoded frame PTS and time base, not frame number divided by FPS. Frames without PTS are skipped.
+- Histogram difference plus ORB feature matching detects probable shot cuts. Shot-local tracking and stabilization reset at a cut. ORB homographies map sampled coordinates to the shot reference frame. Track association uses stabilized positions, constant-velocity prediction, global assignment, and available appearance embeddings; the default local re-association window is 5 seconds.
+- If Ultralytics is installed with an available model, detection uses CPU tracking with BoT-SORT and its camera-motion compensation. Set `tracking.backend: openvino` to request an OpenVINO export. If the learned detector cannot be loaded, a generic foreground-contour proposal detector runs and labels proposals `unknown`.
+- Track appearance defaults to color histograms; optional CLIP embeddings can be used when Transformers and model weights are present. Global ReID merges are logged with score and whether the merge crossed a cut.
+- Rule-derived track, zone, stationary, motion, interaction, line-crossing, audio, and candidate pickup/putdown events are stored in SQLite. User geometry is JSON in normalized coordinates, for example:
+
+```json
+{
+  "zones": [{"name": "entry", "polygon": [[0.1, 0.2], [0.8, 0.2], [0.8, 0.9], [0.1, 0.9]]}],
+  "lines": [{"name": "threshold", "start": [0.2, 0.5], "end": [0.8, 0.5]}]
+}
+```
+
+- Audio extraction uses FFmpeg and spectral flux, RMS, tonalness, and silence checks. WebRTC VAD is optional. Videos without audio are skipped without error.
+- CLIP/SigLIP-style frame embeddings are optional and are indexed at 1 FPS when the configured Transformers model is locally available. Hosted OpenAI VLM use requires `OPENAI_API_KEY` and the optional `openai` package. VLM inputs are restricted to short candidate windows and payload-limited frames. A local Qwen backend can be selected by configuration when its runtime dependencies and weights are installed.
+- The rule-based planner is always available. With a hosted client configured, an LLM can produce a strict JSON query plan that is validated by Pydantic; otherwise deterministic parsing is used. Single-answer queries use candidate-first SQL/audio/CLIP/open-vocabulary/VLM resolution. Count, order, and "find every/all" queries exhaustively inspect indexed evidence and semantic windows across the full video; on-demand open-vocabulary detection samples the full video at 2 FPS and consolidates detections into tracks. VLM prompts include each sampled frame's source PTS and require absolute PTS timestamps and explicit no-match responses. Count and list answers include per-event timestamps, and duration predicates filter intervals by their measured PTS span. A low-confidence best-candidate window is returned when nothing matches. Every answer has a positive-duration PTS interval, track/event IDs, confidence, source, and uncertainty, and renders as `answer [mm:ss-mm:ss] tracks=... events=... confidence=... source=... uncertainty=...`. Videos over one hour use `hh:mm:ss`.
+- Causal wording is not emitted. Cause/effect-style questions receive an ordered preceding-events list with timestamps and, when a VLM is configured, plausibility ratings that are explicitly not causal proof.
+
+## Optional Model Backends
+
+The base install does not download model weights. Optional integrations are intentionally lazy or guarded:
+
+- YOLO11/OpenVINO: install Ultralytics and use an existing compatible model file; OpenVINO export is requested with `tracking.backend: openvino`.
+- YOLO-World: loaded only for on-demand, question-conditioned detection in candidate windows; provide local weights with `TEMPORALVIDEO_YOLOWORLD_MODEL`.
+- CLIP: install `transformers` and `torch`, and ensure the configured model weights are already available locally. Automatic indexing does not download them.
+- Hosted VLM/planner: install `openai` and set `OPENAI_API_KEY` in the shell. The key is never stored in project files. The same client can produce the strict query plan and judge short candidate windows.
+- WebRTC VAD: install `webrtcvad`.
+
+If these are missing, temporal answers fall back to rule, motion, audio, and appearance evidence with confidence reduced where semantic judgment is required.
+
+## Commands
+
+```bash
+python cli.py index video.mp4 [--zones zones.json] [--force]
+python cli.py ask video.mp4 "question" [--zones zones.json]
+python cli.py eval gt.json
+python scripts/prepare_data.py --dataset charades-sta --root /data/Charades-STA --out eval.json
+python scripts/render_ground_truth.py eval.json --output-dir overlays
+python -m pytest -q
+```
+
+Evaluation JSON is an array of `{ "video", "question", "answer", "t_start", "t_end" }`. Reports median mean-boundary timestamp error, the percentage within +/-1 second, token-coverage answer accuracy, and a half-credit score (correct answer but wrong time earns 0.5).
+
+`prepare_data.py` converts subsets already downloaded by the user. VIRAT, MOT17, and Charades-STA have dataset-specific terms and access requirements; download manually from the official dataset source and confirm your permitted use. MOT17 frame annotations are mapped to decoded PTS before writing evaluation timestamps.
+
+## File Tree
+
+```text
+TemporalVideoQA/
+|-- .github/copilot-instructions.md
+|-- .gitignore
+|-- app.py
+|-- audio.py
+|-- cli.py
+|-- config.yaml
+|-- db.py
+|-- detect_track.py
+|-- events.py
+|-- executor.py
+|-- ingest.py
+|-- planner.py
+|-- reid.py
+|-- schema.py
+|-- semantic.py
+|-- verify.py
+|-- vlm_client.py
+|-- zones.py
+|-- requirements.txt
+|-- README.md
+|-- scripts/
+|   |-- prepare_data.py
+|   `-- render_ground_truth.py
+`-- tests/
+    `-- test_pipeline.py
+```
+
+## Module Smoke Commands
+
+Run these from the repository root after installing requirements. They import each module without loading optional model weights.
+
+```bash
+python -c "import schema"
+python -c "import zones"
+python -c "import db"
+python -c "import ingest"
+python -c "import detect_track"
+python -c "import reid"
+python -c "import events"
+python -c "import audio"
+python -c "import semantic"
+python -c "import planner"
+python -c "import executor"
+python -c "import verify"
+python -c "import vlm_client"
+python -c "import cli"
+python -m py_compile app.py
+python -m pytest tests/test_pipeline.py -q
+```
+
+## Known Limits
+
+- The 0.6-1.0x video-length indexing target is an estimate for the configured Intel i5-1335U CPU when the detector is exported to OpenVINO and optional heavyweight semantic models are disabled. Actual speed depends on codec, resolution, thermal limits, and installed inference runtimes; the Python/OpenCV contour fallback can be slower and is not a semantic object detector.
+- Generic foreground proposals do not identify arbitrary object categories. Open-vocabulary class quality depends on YOLO-World/OWLv2 availability; neither can guarantee recognition of every phrase or fine-grained action.
+- Long-absence ReID is conservative and appearance-only fallback embeddings can merge similar-looking objects or miss the same identity under major appearance/view changes. Every merge has a score, but this is not identity certainty.
+- VLM-reported timestamps are generally +/-5-10 seconds until an applicable boundary-specific verifier is available. High-rate re-decode currently narrows sampling uncertainty but does not itself infer semantic start/end boundaries.
+- ORB camera stabilization is approximate. Strong parallax, blur, zoom, low texture, and moving foreground can corrupt stabilized coordinates. Zones are shot-specific; moving-camera zones should be reviewed and confirmed by the user.
+- Stationary, pick-up/put-down, interaction, and line-crossing records are heuristic evidence. Small static objects that were never detected cannot be tracked reliably; background subtraction only proposes foreground candidates. Speech detection needs optional VAD; audio tone labels do not prove a siren, beep, or alarm class.
+- The local Qwen/VLM and hosted VLM are optional. With no working client, subjective judgments such as "unexpectedly" or "delivery" are returned as low-confidence candidates rather than invented facts.
+- The current planner is a deterministic fallback, not a general-purpose LLM. Complex count semantics, ambiguous references, and arbitrary compound relations may need VLM/API configuration and user review.
+- This is an evidence-indexing baseline, not a guarantee of correct answers to arbitrary questions. The no-model fallback detects motion/foreground, not object meaning or action semantics. For the judging examples involving arbitrary classes (“delivery truck”), subjective states (“unexpectedly”), identity through long occlusions, or named acoustic classes (“safety alarm”), install/configure appropriate detector, appearance, and hosted/local VLM backends and validate them on held-out videos. Without those backends, the answer is intentionally low confidence.
