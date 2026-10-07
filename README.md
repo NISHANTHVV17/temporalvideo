@@ -1,10 +1,26 @@
 # TemporalVideoQA
 
-TemporalVideoQA builds a structured temporal index before answering natural-language questions. The CPU-first base uses PyAV PTS timestamps, OpenCV scene/motion analysis, SQLite evidence, and optional model backends. It does not send full videos to a VLM. Model-backed judgments operate only on short candidate windows.
+TemporalVideoQA turns a video into a timestamped evidence log and answers temporal questions such as:
 
-## Quick Start
+- Which person entered a restricted area after a truck arrived?
+- How many times did a machine stop?
+- What happened immediately before an alarm?
+- Which objects remained stationary for more than two minutes?
 
-Requirements: Python 3.10+, FFmpeg available on `PATH` for audio extraction, and a CPU-capable OpenCV/PyAV install.
+The system is CPU-first and preserves decoded source PTS timestamps. It combines deterministic video/audio indexing with optional hosted or local models. Follow-up questions use the saved event log; Groq can answer from that log without receiving the video again.
+
+## Technologies And Models
+
+- Python, PyAV, OpenCV, NumPy, SciPy, FFmpeg, and SQLite for ingestion, timestamps, audio features, motion events, tracking, and evidence storage.
+- Pydantic for validated query plans and answers.
+- Ultralytics YOLO11n with BoT-SORT when available; a CPU contour detector is the fallback.
+- Optional OpenVINO, CLIP, YOLO-World, Qwen2.5-VL, Gemini, and NVIDIA hosted VLM backends.
+- TwelveLabs Pegasus 1.6 for the default timestamped video summary.
+- Groq's OpenAI-compatible API for optional text-only answers from the saved TwelveLabs log. The default available model is `openai/gpt-oss-20b`.
+
+## Installation
+
+Requirements: Python 3.10+, FFmpeg available on `PATH`, and a CPU-capable OpenCV/PyAV install.
 
 ```bash
 python -m venv .venv
@@ -16,7 +32,51 @@ python cli.py eval ground_truth.json
 streamlit run app.py
 ```
 
-The Streamlit UI accepts uploads up to 120 seconds, allows normalized zone polygons to be drawn or supplied as JSON, indexes the video, and plays the selected time window. Longer videos are supported through the CLI. The first index run is linear; later runs reuse an index keyed by SHA-256. A checkpoint is written during indexing. Resume replays decoded frames to restore tracker state, then persists from the last checkpoint; it favors deterministic continuity over fast seek and may therefore repeat decode work after interruption.
+Install the optional OpenAI-compatible client if using Groq or a hosted NVIDIA backend:
+
+```bash
+python -m pip install openai
+```
+
+The Streamlit UI accepts uploads up to 120 seconds, indexes the video, displays the saved timeline, and plays the selected answer interval. Longer videos are supported through the CLI. The first index run is linear; later runs reuse an index keyed by SHA-256. A checkpoint is written during indexing.
+
+## Configuration
+
+Copy the following settings into a project-local `.env` file. Never commit real keys:
+
+```dotenv
+GROQ_KEY=your-groq-key
+GROQ_MODEL=openai/gpt-oss-20b
+TWELVELABS_API_KEY=your-twelvelabs-key
+```
+
+`GROQ_API_KEY` is also accepted. `GROQ_KEY` is the name used by the demonstrated setup. TwelveLabs creates the event log; Groq receives only that saved structured log and the question. If Groq is unavailable, the deterministic log-answer fallback is used. The main settings are in [config.yaml](config.yaml), including sampling, tracking, audio, VLM, semantic, and UI limits.
+
+## Reproduce The Demonstrated Result
+
+The repository includes `a1.mp4`, the sample video used for the demonstrated minivan result.
+
+1. Activate the virtual environment and install the requirements as shown above.
+2. Put valid TwelveLabs and Groq credentials in `.env`.
+3. Generate or refresh the timestamped event log:
+
+```bash
+python cli.py summarize a1.mp4
+```
+
+4. Ask the count question:
+
+```bash
+python cli.py ask a1.mp4 "How many times did the minivan fall?"
+```
+
+The saved log contains one falling interval, from approximately 2.5 to 6.5 seconds, so the answer should be `1` and cite that interval. The exact wording and confidence can vary by model, but the answer must use an event ID and timestamps from the saved log. To use the UI instead, run `streamlit run app.py`, open the displayed local URL, upload `a1.mp4`, analyze it, and submit the same question.
+
+For an offline regression check that does not call hosted services or download models:
+
+```bash
+python -m pytest -q
+```
 
 ## What Runs By Default
 
@@ -34,7 +94,7 @@ The Streamlit UI accepts uploads up to 120 seconds, allows normalized zone polyg
 ```
 
 - Audio extraction uses FFmpeg and spectral flux, RMS, tonalness, and silence checks. WebRTC VAD is optional. Videos without audio are skipped without error.
-- Frame embeddings are optional and indexed at 1 FPS. Set `NVIDIA_EMBEDDING_API_KEY` to use NVIDIA's multimodal Nemotron Embed VL model (`nvidia/llama-nemotron-embed-vl-1b-v2`) for frame and text-query embeddings in the same retrieval space; set `semantic.provider: local` to use locally cached CLIP instead. Summarization defaults to TwelveLabs Pegasus 1.6 using `TWELVELABS_API_KEY`: it sends the MP4 inline once and saves the model's timestamped event lines beside the evidence database as `<video-id>.summary.txt`. Follow-up `ask` questions are answered locally from that saved timeline; the video is not uploaded again, and questions unsupported by the log are rejected rather than guessed. A local Qwen, Gemini, or hosted NVIDIA backend can still be selected for summary generation.
+- Frame embeddings are optional and indexed at 1 FPS. Set `NVIDIA_EMBEDDING_API_KEY` to use NVIDIA's multimodal Nemotron Embed VL model (`nvidia/llama-nemotron-embed-vl-1b-v2`) for frame and text-query embeddings in the same retrieval space; set `semantic.provider: local` to use locally cached CLIP instead. Summarization defaults to TwelveLabs Pegasus 1.6 using `TWELVELABS_API_KEY`: it sends the MP4 inline once and saves the model's timestamped event lines beside the evidence database as `<video-id>.summary.txt`. Follow-up `ask` questions use that saved timeline; Groq is the optional log-grounded answer model, and the deterministic fallback is used when no working LLM is configured. The video is not uploaded again for follow-up questions, and unsupported details are not guessed. A local Qwen, Gemini, or hosted NVIDIA backend can still be selected for summary generation.
 - The rule-based planner is always available. With a hosted client configured, an LLM can produce a strict JSON query plan that is validated by Pydantic; otherwise deterministic parsing is used. Single-answer queries use candidate-first SQL/audio/CLIP/open-vocabulary/VLM resolution. Count, order, and "find every/all" queries exhaustively inspect indexed evidence and semantic windows across the full video; on-demand open-vocabulary detection samples the full video at 2 FPS and consolidates detections into tracks. VLM prompts include each sampled frame's source PTS and require absolute PTS timestamps and explicit no-match responses. Count and list answers include per-event timestamps, and duration predicates filter intervals by their measured PTS span. A low-confidence best-candidate window is returned when nothing matches. Every answer has a positive-duration PTS interval, track/event IDs, confidence, source, and uncertainty, and renders as `answer [mm:ss-mm:ss] tracks=... events=... confidence=... source=... uncertainty=...`. Videos over one hour use `hh:mm:ss`.
 - Causal wording is not emitted. Cause/effect-style questions receive an ordered preceding-events list with timestamps and, when a VLM is configured, plausibility ratings that are explicitly not causal proof.
 
@@ -44,7 +104,7 @@ The Streamlit UI accepts uploads up to 120 seconds, allows normalized zone polyg
 |---|---|---|
 | Timestamp every answer | Analyze the video, then ask with `python cli.py ask video.mp4 "..."`; output includes a supporting interval, source, confidence, and summary-line evidence IDs. | Answers only use details recorded in the saved summary. Unrecorded details are not inferred. |
 | Order, before/after, and elapsed time | Ask `What happened right before ...?`, `... after ...?`, or `How long between ... and ...?`. | Reports observed sequence; it does not claim one event caused another. |
-| Restricted-area entry | Supply a named polygon in `--zones zones.json` or draw it in the UI, then ask who entered it. | Use a real detector label; generic fallback proposals are `unknown`. |
+| Restricted-area entry | Supply a named polygon in `--zones zones.json`, then ask who entered it. | Use a real detector label; generic fallback proposals are `unknown`. |
 | Repeated stops and counts | Ask `How many times did the machine stop?`; each occurrence is returned with its timestamp. | The stop is a motion/event heuristic. Define what counts as unexpected and validate against labeled examples. |
 | Stationary objects over two minutes | Ask for objects untouched for more than 2 minutes; stationary intervals are duration-filtered using PTS. | Occlusion or missed detections can split an interval. |
 | People/object tracking | Auto mode attempts CPU YOLO11n with BoT-SORT; persistent tracker IDs and appearance-based cross-shot re-identification are retained. | Identity can still be wrong after long occlusion, similar appearances, or leaving and re-entering. Review reported merge scores. |
