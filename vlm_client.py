@@ -258,6 +258,82 @@ class TwelveLabsVideoSummaryClient:
             excerpt = text[:300].replace("\n", " ")
             raise RuntimeError(f"TwelveLabs returned invalid timestamped events: {exc}; response={excerpt!r}") from exc
 
+    def answer_question(self, video_path: str, question: str,
+                        duration: float) -> dict[str, Any]:
+        if not self.api_key:
+            raise RuntimeError("TWELVELABS_API_KEY is not configured")
+        video_bytes = Path(video_path).read_bytes()
+        if len(video_bytes) > 30 * 1024 * 1024:
+            raise ValueError("TwelveLabs inline video input must be 30 MB or smaller")
+        prompt = (
+            "Answer the user's question using only evidence from this video. Be direct and concise. "
+            "When the question says 'normally' or implies a general rule, do not generalize from one clip; "
+            "state what this clip shows and qualify the limitation. Give the absolute video interval that "
+            "supports the answer, in seconds from the beginning of the clip. For duration questions, report "
+            "the elapsed duration in the answer while the timestamp fields delimit the supporting interval. "
+            "Describe temporal sequence and do not claim causation. Return only a JSON object with keys "
+            "answer, timestamp_start, timestamp_end, confidence, and uncertainty_seconds. Confidence must "
+            "be between 0 and 1; uncertainty_seconds must be nonnegative. The clip duration is "
+            f"{duration:.3f} seconds. User question: {question}"
+        )
+        request_body = {
+            "model_name": self.model,
+            "video": {
+                "type": "base64_string",
+                "base64_string": base64.b64encode(video_bytes).decode("ascii"),
+            },
+            "prompt": prompt,
+            "stream": False,
+            "temperature": 0.1,
+            "max_tokens": 1024,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                        "timestamp_start": {"type": "number"},
+                        "timestamp_end": {"type": "number"},
+                        "confidence": {"type": "number"},
+                        "uncertainty_seconds": {"type": "number"},
+                    },
+                    "required": ["answer", "timestamp_start", "timestamp_end",
+                                 "confidence", "uncertainty_seconds"],
+                },
+            },
+        }
+        request = urllib.request.Request(
+            "https://api.twelvelabs.io/v1.3/analyze",
+            data=json.dumps(request_body).encode("utf-8"),
+            headers={"x-api-key": self.api_key, "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"TwelveLabs API returned HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"TwelveLabs API request failed: {exc.reason}") from exc
+        if result.get("finish_reason") == "length":
+            raise RuntimeError("TwelveLabs answer was truncated")
+        try:
+            answer = json.loads(str(result.get("data") or ""))
+            start = float(answer["timestamp_start"])
+            end = float(answer["timestamp_end"])
+            confidence = float(answer["confidence"])
+            uncertainty = float(answer["uncertainty_seconds"])
+            text = str(answer["answer"]).strip()
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("TwelveLabs returned an invalid structured answer") from exc
+        if (not text or not all(math.isfinite(value) for value in (start, end, confidence, uncertainty))
+                or start < 0 or end <= start or end > duration or not 0 <= confidence <= 1
+                or uncertainty < 0):
+            raise RuntimeError("TwelveLabs answer failed timestamp or confidence validation")
+        return {"answer": text, "timestamp_start": start, "timestamp_end": end,
+                "confidence": confidence, "uncertainty_seconds": uncertainty}
+
 
 def _merge_summary_events(events: list[dict[str, str]]) -> list[dict[str, str]]:
     ordered = sorted(events, key=lambda item: float(item["time"].split("-", 1)[0]))

@@ -124,8 +124,7 @@ if upload is not None:
         question = st.text_input("Question", placeholder="What happened right before the loud sound?")
         if st.button("Ask", disabled=not question.strip()):
             with st.spinner("Resolving indexed evidence..."):
-                answer = ask_video(temp_path, question,
-                                   zone_path=st.session_state.get("zone_path"))
+                answer = ask_video(temp_path, question)
             st.markdown(f"**{answer.render(info.duration)}**")
             st.caption(f"Source: {answer.timestamp_source} | confidence {answer.confidence:.2f} | "
                        f"uncertainty +/-{answer.uncertainty_seconds:.1f}s")

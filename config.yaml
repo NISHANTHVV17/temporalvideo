@@ -36,6 +36,7 @@ audio:
   ffmpeg: ffmpeg
 vlm:
   backend: auto
+  qa_backend: twelvelabs
   local_model: Qwen/Qwen2.5-VL-3B-Instruct
   summary_backend: twelvelabs
   twelvelabs_model: pegasus1.6

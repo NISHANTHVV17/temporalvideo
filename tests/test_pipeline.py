@@ -346,6 +346,74 @@ def test_twelvelabs_summary_sends_inline_video_and_parses_events(monkeypatch, tm
     ]
 
 
+def test_twelvelabs_answer_question_validates_structured_timestamps(monkeypatch, tmp_path):
+    import json
+    from io import BytesIO
+
+    from vlm_client import TwelveLabsVideoSummaryClient
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"synthetic mp4")
+    monkeypatch.setenv("TWELVELABS_API_KEY", "test-twelvelabs-key")
+    answer_data = {
+        "answer": "The van was on the plank for about 3 seconds before it began to fall.",
+        "timestamp_start": 0.0,
+        "timestamp_end": 3.0,
+        "confidence": 0.9,
+        "uncertainty_seconds": 0.5,
+    }
+    monkeypatch.setattr("vlm_client.urllib.request.urlopen", lambda *_args, **_kwargs: BytesIO(
+        json.dumps({"data": json.dumps(answer_data), "finish_reason": "stop"}).encode()))
+
+    result = TwelveLabsVideoSummaryClient().answer_question(
+        str(video), "How long was the van on the plank before falling?", 10.0)
+
+    assert result == answer_data
+
+
+def test_ask_video_uses_twelvelabs_and_persists_answer_evidence(tmp_path, monkeypatch):
+    import cli
+
+    video_id = "question-video"
+    database_path = tmp_path / f"{video_id}.sqlite3"
+    database = EvidenceDB(database_path)
+    database.add_video(video_id, "clip.mp4", "sha", 10.0, 640, 360)
+    database.close()
+    result = {
+        "answer": "The van was on the plank for about 3 seconds before it began to fall.",
+        "timestamp_start": 0.0,
+        "timestamp_end": 3.0,
+        "confidence": 0.9,
+        "uncertainty_seconds": 0.5,
+    }
+    called = []
+
+    class FakeTwelveLabs:
+        def __init__(self, model):
+            assert model == "pegasus1.6"
+
+        def answer_question(self, video_path, question, duration):
+            called.append((video_path, question, duration))
+            return result
+
+    monkeypatch.setattr(cli, "read_config", lambda _path: {
+        "vlm": {"qa_backend": "twelvelabs", "twelvelabs_model": "pegasus1.6"}})
+    monkeypatch.setattr(cli, "index_video", lambda *_args, **_kwargs: (video_id, database_path))
+    monkeypatch.setattr("vlm_client.TwelveLabsVideoSummaryClient", FakeTwelveLabs)
+
+    answer = cli.ask_video("clip.mp4", "How long was the van on the plank before falling?")
+    stored = EvidenceDB(database_path)
+    event = stored.rows("SELECT * FROM events WHERE event_id=?", (answer.event_ids[0],))[0]
+
+    assert called and called[0][1] == "How long was the van on the plank before falling?"
+    assert answer.answer == result["answer"]
+    assert (answer.t_start, answer.t_end) == (0.0, 3.0)
+    assert answer.timestamp_source == "vlm"
+    assert answer.confidence == 0.9
+    assert event["event_type"] == "twelvelabs_answer_evidence"
+    stored.close()
+
+
 def test_answer_requires_timestamp_and_formats_long_video():
     with pytest.raises(ValidationError):
         Answer(answer="missing", confidence=0.1, low_confidence=True,

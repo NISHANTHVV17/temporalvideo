@@ -8,6 +8,7 @@ import logging
 import math
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -264,6 +265,39 @@ def ask_video(video_path: str | Path, question: str, config_path: str | Path | N
     db = EvidenceDB(db_path)
     try:
         row = db.rows("SELECT duration FROM videos WHERE video_id=?", (video_id,))[0]
+        vlm_config = config.get("vlm", {})
+        qa_backend = vlm_config.get("qa_backend", "twelvelabs")
+        if qa_backend == "twelvelabs":
+            from vlm_client import TwelveLabsVideoSummaryClient
+            model = vlm_config.get("twelvelabs_model", "pegasus1.6")
+            result = TwelveLabsVideoSummaryClient(model).answer_question(
+                str(Path(video_path).resolve()), question, float(row["duration"]))
+            event_id = uuid.uuid4().hex
+            db.add_event({
+                "event_id": event_id,
+                "video_id": video_id,
+                "track_id": None,
+                "class": "scene",
+                "event_type": "twelvelabs_answer_evidence",
+                "t_start": result["timestamp_start"],
+                "t_end": result["timestamp_end"],
+                "zone": None,
+                "confidence": result["confidence"],
+                "meta_json": json.dumps({"question": question, "answer": result["answer"],
+                                          "model": model}),
+            })
+            db.write_event_log(video_id)
+            return Answer(
+                answer=result["answer"],
+                t_start=result["timestamp_start"],
+                t_end=result["timestamp_end"],
+                event_ids=[event_id],
+                confidence=result["confidence"],
+                low_confidence=result["confidence"] < 0.35,
+                video_duration=float(row["duration"]),
+                timestamp_source="vlm",
+                uncertainty_seconds=result["uncertainty_seconds"],
+            )
         tracks = db.rows("SELECT * FROM tracks WHERE video_id=?", (video_id,))
         merges = merge_tracks([{"track_id": item["track_id"], "class": item["class"],
                                 "shot_id": item["shot_id"], "t_start": item["t_start"],
@@ -274,7 +308,6 @@ def ask_video(video_path: str | Path, question: str, config_path: str | Path | N
                               float(config["reid"]["max_exit_reentry_seconds"]))
         from executor import QueryExecutor
         from vlm_client import choose_vlm
-        vlm_config = config.get("vlm", {})
         backend = vlm_config.get("backend", "auto")
         vlm = choose_vlm(backend=backend,
                  model_name=vlm_config.get("local_model") if backend == "local" else None)
