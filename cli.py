@@ -203,7 +203,9 @@ def index_video(video_path: str | Path, config_path: str | Path | None = None,
         db.execute("UPDATE videos SET metadata_json=? WHERE video_id=?",
                (json.dumps({"time_base": info.time_base, "audio_streams": info.audio_streams,
                     "complete": True, "semantic_provider": semantic_provider}), video_id))
+        log_path = db.write_event_log(video_id)
         print(f"Indexed {sample_count} sampled frames to {db_path}")
+        print(f"Saved event log to {log_path}")
         return video_id, db_path
     finally:
         db.close()
@@ -272,13 +274,45 @@ def ask_video(video_path: str | Path, question: str, config_path: str | Path | N
                               float(config["reid"]["max_exit_reentry_seconds"]))
         from executor import QueryExecutor
         from vlm_client import choose_vlm
-        vlm = choose_vlm(backend=config.get("vlm", {}).get("backend", "auto"),
-                         model_name=config.get("vlm", {}).get("local_model"))
+        vlm_config = config.get("vlm", {})
+        backend = vlm_config.get("backend", "auto")
+        vlm = choose_vlm(backend=backend,
+                 model_name=vlm_config.get("local_model") if backend == "local" else None)
         answer = QueryExecutor(db, video_id, video_path, float(row["duration"]),
                                _project_path(config["indexing"]["cache_dir"]), merges, vlm=vlm,
                                before_after_seconds=float(config["query"]["before_after_seconds"]),
                                semantic_provider=config.get("semantic", {}).get("provider")).ask(question)
         return answer
+    finally:
+        db.close()
+
+
+def summary_output_path(video_path: str | Path, config_path: str | Path | None = None) -> Path:
+    video_id = file_sha256(Path(video_path).resolve())[:20]
+    return _db_path(read_config(config_path), video_id).with_name(f"{video_id}.summary.txt")
+
+
+def summarize_video(video_path: str | Path, config_path: str | Path | None = None,
+                    zone_path: str | Path | None = None) -> list[dict[str, str]]:
+    config = read_config(config_path)
+    from vlm_client import choose_summary_client
+    vlm_config = config.get("vlm", {})
+    backend = vlm_config.get("summary_backend", "twelvelabs")
+    model_name = (vlm_config.get("local_model") if backend == "local"
+                  else vlm_config.get("twelvelabs_model", "pegasus1.6") if backend == "twelvelabs"
+                  else vlm_config.get("gemini_model", "gemini-3.8-flash") if backend == "gemini"
+                  else vlm_config.get("summary_model", "nvidia/cosmos-reason2-8b"))
+    vlm = choose_summary_client(backend=backend, model_name=model_name)
+    if vlm is None:
+        raise RuntimeError("No VLM is configured. Set a hosted VLM API key or configure a local VLM model.")
+    video_id, db_path = index_video(video_path, config_path, zone_path=zone_path)
+    db = EvidenceDB(db_path)
+    try:
+        video = db.rows("SELECT duration FROM videos WHERE video_id=?", (video_id,))[0]
+        summary = vlm.summarize(str(Path(video_path).resolve()), float(video["duration"]))
+        summary_path = db.write_summary_log(video_id, summary)
+        print(f"Saved summary to {summary_path}")
+        return summary
     finally:
         db.close()
 
@@ -328,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
     ask_parser.add_argument("video")
     ask_parser.add_argument("question")
     ask_parser.add_argument("--zones")
+    summary_parser = subparsers.add_parser("summarize", help="generate a VLM-based Time/Event timeline")
+    summary_parser.add_argument("video")
     eval_parser = subparsers.add_parser("eval", help="evaluate against ground-truth JSON")
     eval_parser.add_argument("gt_json")
     args = parser.parse_args(argv)
@@ -346,6 +382,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"[{format_timestamp(item.start, answer.video_duration)}-"
                     f"{format_timestamp(item.end, answer.video_duration)}] "
                       f"rating={item.relation_rating}")
+        elif args.command == "summarize":
+            summary = summarize_video(args.video, args.config)
+            print("Time\tEvent")
+            for item in summary:
+                print(f"{item['time']}\t{item['event']}")
         else:
             print(json.dumps(evaluate(args.gt_json, args.config), indent=2))
     except Exception as exc:

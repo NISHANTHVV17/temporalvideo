@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import html
+import hashlib
 import tempfile
 from pathlib import Path
 
 import streamlit as st
 
-from cli import ask_video, index_video, read_config
+from cli import ask_video, read_config, summarize_video, summary_output_path
 from ingest import iter_video, probe_video
 
 
@@ -21,9 +22,11 @@ if upload is not None:
     if upload.size > int(config["app"]["max_upload_bytes"]):
         st.error("This upload exceeds the configured size limit.")
         st.stop()
+    video_bytes = upload.getvalue()
+    upload_id = hashlib.sha256(video_bytes).hexdigest()[:20]
     suffix = Path(upload.name).suffix or ".mp4"
-    temp_path = Path(tempfile.gettempdir()) / f"temporalvideo-upload{suffix}"
-    temp_path.write_bytes(upload.getvalue())
+    temp_path = Path(tempfile.gettempdir()) / f"temporalvideo-upload-{upload_id}{suffix}"
+    temp_path.write_bytes(video_bytes)
     try:
         info = probe_video(temp_path)
     except Exception as exc:
@@ -35,7 +38,7 @@ if upload is not None:
 
     left, right = st.columns([1.35, 1])
     with left:
-        st.video(upload.getvalue())
+        st.video(video_bytes)
     with right:
         st.caption(f"{info.width} x {info.height} | {info.duration:.1f}s | {info.audio_streams} audio stream(s)")
         first = next(iter_video(temp_path, sample_fps=0.2, max_dimension=960), None)
@@ -83,25 +86,46 @@ if upload is not None:
             except ImportError:
                 st.caption("Install streamlit-drawable-canvas to draw zones; JSON entry remains available.")
 
-    if st.button("Index video", type="primary", disabled=geometry is None):
+    if st.button("Analyze video", type="primary", disabled=geometry is None):
         zone_path = None
         if geometry and (geometry.get("zones") or geometry.get("lines")):
             zone_file = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
             json.dump(geometry, zone_file)
             zone_file.close()
             zone_path = zone_file.name
-        with st.spinner("Indexing sampled frames and audio..."):
-            video_id, database = index_video(temp_path, force=False, zone_path=zone_path)
-        st.success(f"Index ready: {video_id}")
-        st.session_state["indexed_video"] = str(temp_path)
-        st.session_state["indexed_id"] = video_id
-        st.session_state["database"] = str(database)
+        try:
+            with st.spinner("Indexing evidence and analyzing the video with TwelveLabs..."):
+                summary = summarize_video(temp_path, zone_path=zone_path)
+            summary_path = summary_output_path(temp_path)
+            st.session_state["analyzed_upload_id"] = upload_id
+            st.session_state["summary"] = summary
+            st.session_state["summary_path"] = str(summary_path)
+            st.session_state["indexed_video"] = str(temp_path)
+            st.session_state["zone_path"] = zone_path
+            st.success("Video analysis complete")
+        except Exception as exc:
+            st.error(f"Video analysis failed: {exc}")
+
+    if st.session_state.get("analyzed_upload_id") == upload_id:
+        summary = st.session_state.get("summary", [])
+        summary_path = Path(st.session_state["summary_path"])
+        st.subheader("Time / Event")
+        if summary:
+            st.table(summary)
+        else:
+            st.info("No notable events were returned for this video.")
+        summary_text = "Time\tEvent\n" + "".join(
+            f"{item['time']}\t{item['event']}\n" for item in summary)
+        st.download_button("Download summary", summary_text, file_name=summary_path.name,
+                           mime="text/plain", key=f"download-summary-{upload_id}")
+        st.markdown(f"Saved to `{summary_path}`")
 
     if st.session_state.get("indexed_video") == str(temp_path):
         question = st.text_input("Question", placeholder="What happened right before the loud sound?")
         if st.button("Ask", disabled=not question.strip()):
             with st.spinner("Resolving indexed evidence..."):
-                answer = ask_video(temp_path, question)
+                answer = ask_video(temp_path, question,
+                                   zone_path=st.session_state.get("zone_path"))
             st.markdown(f"**{answer.render(info.duration)}**")
             st.caption(f"Source: {answer.timestamp_source} | confidence {answer.confidence:.2f} | "
                        f"uncertainty +/-{answer.uncertainty_seconds:.1f}s")
@@ -112,7 +136,7 @@ if upload is not None:
                          f"{format_timestamp(answer.t_end, info.duration)}")
             st.markdown(f'<a href="#answer-clip">{html.escape(timestamp)}</a>', unsafe_allow_html=True)
             st.markdown('<div id="answer-clip"></div>', unsafe_allow_html=True)
-            st.video(upload.getvalue(), start_time=int(answer.t_start), end_time=max(int(answer.t_start) + 1, int(answer.t_end)))
+            st.video(video_bytes, start_time=int(answer.t_start), end_time=max(int(answer.t_start) + 1, int(answer.t_end)))
             if answer.preceding_events:
                 st.subheader("Preceding events")
                 for event in answer.preceding_events:

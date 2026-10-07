@@ -12,7 +12,7 @@ import pytest
 from pydantic import ValidationError
 
 from db import EvidenceDB
-from detect_track import Detection, MultiObjectTracker
+from detect_track import Detection, MultiObjectTracker, TrackObservation
 from executor import QueryExecutor
 from events import _segments_intersect, build_track_events
 from ingest import FrameSample, iter_video
@@ -68,6 +68,282 @@ def create_synthetic_video(directory: Path) -> tuple[Path, bool]:
                              "-c:v", "copy", "-c:a", "aac", "-shortest", str(with_audio)],
                             capture_output=True, check=False)
     return (with_audio, True) if result.returncode == 0 else (silent, False)
+
+
+def test_event_log_file_contains_timestamps(tmp_path):
+    database = EvidenceDB(tmp_path / "evidence.sqlite3")
+    video_id = "test-video"
+    event = {
+        "event_id": "event-1",
+        "video_id": video_id,
+        "track_id": "track-1",
+        "class": "car",
+        "event_type": "appear",
+        "t_start": 12.5,
+        "t_end": 13.0,
+        "zone": "road",
+        "confidence": 0.91,
+        "meta_json": '{"note": "vehicle seen"}'
+    }
+    database.execute(
+        "INSERT OR REPLACE INTO events (event_id,video_id,track_id,class,event_type,t_start,t_end,zone,confidence,meta_json) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (event["event_id"], event["video_id"], event["track_id"], event["class"], event["event_type"], event["t_start"], event["t_end"], event["zone"], event["confidence"], event["meta_json"])
+    )
+    log_path = database.write_event_log(video_id)
+    assert log_path.exists()
+    text = log_path.read_text(encoding="utf-8")
+    assert "event-1" in text
+    assert "12.50s" in text or "12.5" in text
+    assert "car" in text
+    database.close()
+
+
+def test_summarize_video_saves_vlm_generated_events(tmp_path, monkeypatch):
+    import cli
+
+    video_id = "summary-video"
+    database_path = tmp_path / f"{video_id}.sqlite3"
+    database = EvidenceDB(database_path)
+    database.add_video(video_id, "clip.mp4", "sha", 4.0, 640, 360)
+    database.close()
+    generated = [{"time": "1.20-2.30 s", "event": "A person opens a red umbrella."}]
+    zone_path = tmp_path / "zones.json"
+    zone_path.write_text('{"zones": []}', encoding="utf-8")
+    index_calls = []
+
+    class FakeVLM:
+        def summarize(self, video_path, duration):
+            assert duration == 4.0
+            assert video_path.endswith("clip.mp4")
+            return generated
+
+    monkeypatch.setattr(cli, "read_config", lambda _path: {
+        "vlm": {"summary_backend": "hosted"}})
+    monkeypatch.setattr(cli, "index_video", lambda *args, **kwargs: (
+        index_calls.append((args, kwargs)) or (video_id, database_path)))
+    monkeypatch.setattr("vlm_client.choose_summary_client", lambda **_kwargs: FakeVLM())
+
+    summary = cli.summarize_video("clip.mp4", "unused-config.yaml", str(zone_path))
+    saved = database_path.with_name(f"{video_id}.summary.txt").read_text(encoding="utf-8")
+
+    assert summary == generated
+    assert index_calls[0][1]["zone_path"] == str(zone_path)
+    assert "1.20-2.30 s\tA person opens a red umbrella." in saved
+
+
+def test_summary_output_path_matches_saved_artifact(tmp_path, monkeypatch):
+    import cli
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video bytes")
+    database_dir = tmp_path / "evidence"
+    monkeypatch.setattr(cli, "read_config", lambda _path: {
+        "indexing": {"database_dir": str(database_dir)}})
+
+    video_id = cli.file_sha256(video)[:20]
+    assert cli.summary_output_path(video).name == f"{video_id}.summary.txt"
+
+
+def test_summarize_video_requires_a_vlm(monkeypatch):
+    import cli
+
+    monkeypatch.setattr(cli, "read_config", lambda _path: {
+        "vlm": {"summary_backend": "hosted"}})
+    monkeypatch.setattr("vlm_client.choose_summary_client", lambda **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="No VLM is configured"):
+        cli.summarize_video("clip.mp4", "unused-config.yaml")
+
+
+def test_summary_log_file_written(tmp_path):
+    database = EvidenceDB(tmp_path / "evidence.sqlite3")
+    summary = [
+        {"time": "1.20-2.30 s", "event": "A person opens a red umbrella."},
+    ]
+    log_path = database.write_summary_log("summary-video", summary)
+    text = log_path.read_text(encoding="utf-8")
+    assert "Time" in text
+    assert "1.20-2.30 s" in text
+    assert "red umbrella" in text
+    database.close()
+
+
+def test_vlm_summary_response_validation_and_overlap_merge():
+    from vlm_client import (
+        _merge_summary_events,
+        _parse_timestamped_event_lines,
+        _parse_summary_events,
+        _summary_windows,
+    )
+
+    events = _parse_summary_events(
+        '{"events":[{"start_seconds":1.2,"end_seconds":2.3,'
+        '"description":"A person opens a red umbrella."},'
+        '{"start_seconds":9,"end_seconds":10,"description":"Outside window."}]}',
+        0.0, 4.0, 4.0)
+    assert events == [{"time": "1.20-2.30 s", "event": "A person opens a red umbrella."}]
+    merged = _merge_summary_events(events + [
+        {"time": "1.50-2.50 s", "event": "A person opens a red umbrella."},
+    ])
+    assert merged == [{"time": "1.20-2.50 s", "event": "A person opens a red umbrella."}]
+    assert _summary_windows(10.0, 7.0, 1.0) == [(0.0, 7.0), (6.0, 10.0)]
+    cosmos_events = _parse_timestamped_event_lines(
+        "0.50-1.75 | A person opens an umbrella.\n00:02.00-00:03.50 | Water splashes.", 4.0)
+    assert cosmos_events == [
+        {"time": "0.50-1.75 s", "event": "A person opens an umbrella."},
+        {"time": "2.00-3.50 s", "event": "Water splashes."},
+    ]
+    assert _parse_timestamped_event_lines("NO_EVENTS", 4.0) == []
+
+
+def test_cosmos_summary_sends_mp4_and_requests_four_fps(monkeypatch, tmp_path):
+    import base64
+    from types import SimpleNamespace
+
+    from vlm_client import HostedOpenAIClient
+
+    video = tmp_path / "clip.mp4"
+    video_bytes = b"synthetic mp4 payload"
+    video.write_bytes(video_bytes)
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content="0.50-1.50 | A person opens a red umbrella."))])
+
+    client = HostedOpenAIClient(model="nvidia/cosmos-reason2-8b", provider="nvidia")
+    monkeypatch.setattr(client, "_client", lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))))
+
+    summary = client.summarize(str(video), 2.0)
+    request = captured
+    content = captured["messages"][0]["content"]
+
+    assert request["model"] == "nvidia/cosmos-reason2-8b"
+    assert content[0]["type"] == "video_url"
+    assert content[0]["video_url"]["url"] == (
+        "data:video/mp4;base64," + base64.b64encode(video_bytes).decode("ascii"))
+    assert content[1]["type"] == "text"
+    assert "List the notable events with approximate timestamps" in content[1]["text"]
+    assert request["extra_body"] == {"media_io_kwargs": {"video": {"fps": 4.0}}}
+    assert "response_format" not in request
+    assert summary == [{"time": "0.50-1.50 s", "event": "A person opens a red umbrella."}]
+
+
+def test_gemini_summary_sends_inline_video_and_parses_events(monkeypatch, tmp_path):
+    import base64
+    import json
+    from io import BytesIO
+
+    from vlm_client import GeminiVideoSummaryClient
+
+    video = tmp_path / "clip.mp4"
+    video_bytes = b"test mp4 bytes"
+    video.write_bytes(video_bytes)
+    monkeypatch.setenv("GEMINI_KEY", "test-gemini-key")
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return BytesIO(json.dumps({"candidates": [{"content": {"parts": [{
+            "text": '{"events":[{"start_seconds":0.5,"end_seconds":1.5,'
+                    '"description":"A person opens an umbrella."}]}'
+        }]}}]}).encode("utf-8"))
+
+    monkeypatch.setattr("vlm_client.urllib.request.urlopen", fake_urlopen)
+    client = GeminiVideoSummaryClient()
+    summary = client.summarize(str(video), 2.0)
+
+    request = captured["request"]
+    body = json.loads(request.data)
+    parts = body["contents"][0]["parts"]
+    assert request.full_url == (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3.8-flash:generateContent")
+    assert request.get_header("X-goog-api-key") == "test-gemini-key"
+    assert "test-gemini-key" not in request.full_url
+    assert parts[0]["inlineData"] == {
+        "mimeType": "video/mp4",
+        "data": base64.b64encode(video_bytes).decode("ascii"),
+    }
+    assert parts[0]["videoMetadata"] == {"fps": 4.0}
+    assert "list its notable visible events" in parts[1]["text"]
+    assert summary == [{"time": "0.50-1.50 s", "event": "A person opens an umbrella."}]
+
+
+def test_gemini_summary_falls_back_after_capacity_503(monkeypatch, tmp_path):
+    import json
+    import urllib.error
+    from io import BytesIO
+
+    from vlm_client import GeminiVideoSummaryClient
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"test mp4 bytes")
+    monkeypatch.setenv("GEMINI_KEY", "test-gemini-key")
+    models = []
+
+    def fake_urlopen(request, timeout):
+        models.append(request.full_url.rsplit("/", 1)[-1].split(":", 1)[0])
+        if len(models) == 1:
+            raise urllib.error.HTTPError(request.full_url, 503, "Unavailable", {},
+                                         BytesIO(b'{"error":{"message":"busy"}}'))
+        response = {"candidates": [{"content": {"parts": [{
+            "text": '{"events":[{"start_seconds":0.2,"end_seconds":0.8,'
+                    '"description":"A light turns on."}]}'
+        }]}}]}
+        return BytesIO(json.dumps(response).encode("utf-8"))
+
+    monkeypatch.setattr("vlm_client.urllib.request.urlopen", fake_urlopen)
+    result = GeminiVideoSummaryClient().summarize(str(video), 1.0)
+
+    assert models == ["gemini-3.8-flash", "gemini-3.7-flash"]
+    assert result == [{"time": "0.20-0.80 s", "event": "A light turns on."}]
+
+
+def test_twelvelabs_summary_sends_inline_video_and_parses_events(monkeypatch, tmp_path):
+    import base64
+    import json
+    from io import BytesIO
+
+    from vlm_client import TwelveLabsVideoSummaryClient
+
+    video = tmp_path / "clip.mp4"
+    video_bytes = b"synthetic mp4"
+    video.write_bytes(video_bytes)
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "test-twelvelabs-key")
+    monkeypatch.delenv("TWELVELABS_API_KEY", raising=False)
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return BytesIO(json.dumps({
+            "data": "0.00-2.80 | A white vehicle is positioned on a raised plank.\n"
+                    "2.80-6.50 | The vehicle tips forward and falls into the water.",
+            "finish_reason": "stop",
+        }).encode("utf-8"))
+
+    monkeypatch.setattr("vlm_client.urllib.request.urlopen", fake_urlopen)
+    result = TwelveLabsVideoSummaryClient().summarize(str(video), 7.0)
+
+    request = captured["request"]
+    body = json.loads(request.data)
+    assert request.full_url == "https://api.twelvelabs.io/v1.3/analyze"
+    assert request.get_header("X-api-key") == "test-twelvelabs-key"
+    assert body["model_name"] == "pegasus1.6"
+    assert body["video"] == {
+        "type": "base64_string",
+        "base64_string": base64.b64encode(video_bytes).decode("ascii"),
+    }
+    assert body["stream"] is False
+    assert "List the notable events with approximate timestamps" in body["prompt"]
+    assert result == [
+        {"time": "0.00-2.80 s", "event": "A white vehicle is positioned on a raised plank."},
+        {"time": "2.80-6.50 s", "event": "The vehicle tips forward and falls into the water."},
+    ]
 
 
 def test_answer_requires_timestamp_and_formats_long_video():
@@ -225,6 +501,50 @@ def test_tracker_reconnects_after_multi_second_occlusion():
     assert returned_track.track_id == first_track.track_id
 
 
+def test_tracker_honors_persistent_detector_id_when_motion_is_ambiguous():
+    tracker = MultiObjectTracker(max_gap_seconds=2.0)
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    def sample(pts):
+        return FrameSample(pts=pts, frame=frame, shot_id=0, to_reference=np.eye(3))
+
+    tracker.update(sample(0.0), [
+        Detection((35, 35, 20, 20), "person", 0.9, external_track_id="bo-7"),
+        Detection((35, 35, 20, 20), "person", 0.9, external_track_id="bo-8"),
+    ])
+    returned = tracker.update(sample(1.0), [
+        Detection((35, 35, 20, 20), "person", 0.9, external_track_id="bo-7")
+    ])[0]
+
+    assert returned.track_id == "s0-tbo-7"
+
+
+def test_auto_detector_attempts_learned_model_even_when_weights_are_not_cached(monkeypatch, tmp_path):
+    from detect_track import make_detector
+
+    requested = []
+
+    class FakeLearnedDetector:
+        def __init__(self, model_path, confidence, openvino=False):
+            requested.append((model_path, confidence, openvino))
+
+    monkeypatch.setattr("detect_track.UltralyticsDetector", FakeLearnedDetector)
+    detector = make_detector("auto", str(tmp_path / "not-cached.pt"), 0.3)
+
+    assert isinstance(detector, FakeLearnedDetector)
+    assert requested == [(str(tmp_path / "not-cached.pt"), 0.3, False)]
+
+
+def test_auto_detector_falls_back_when_learned_backend_cannot_load(monkeypatch, tmp_path):
+    from detect_track import ContourFallbackDetector, make_detector
+
+    def fail_to_load(*args, **kwargs):
+        raise RuntimeError("weights unavailable")
+
+    monkeypatch.setattr("detect_track.UltralyticsDetector", fail_to_load)
+    assert isinstance(make_detector("auto", str(tmp_path / "missing.pt")), ContourFallbackDetector)
+
+
 def test_unmatched_question_still_returns_timestamp_and_evidence_id(tmp_path):
     video, _ = create_synthetic_video(tmp_path)
     database = EvidenceDB(tmp_path / "empty.sqlite3")
@@ -256,6 +576,37 @@ def test_person_after_anchor_relation_uses_ordered_evidence(tmp_path):
     assert answer.t_start <= 4.0 <= answer.t_end
     assert "person-enter" in answer.event_ids
     assert "truck-arrival" in answer.event_ids
+    database.close()
+
+
+def test_track_events_detect_restricted_entry_and_two_minute_stationary_object():
+    database = EvidenceDB(":memory:")
+    restricted = Zone("restricted", [(0.5, 0.0), (1.0, 0.0), (1.0, 1.0), (0.5, 1.0)])
+    observations = []
+
+    for pts in (0.0, 1.0, 2.0):
+        x = 0.2 + pts * 0.1
+        observations.append(TrackObservation("truck-1", "1", 0, pts, "truck",
+                                              (0, 0, 1, 1), 0.9, None, (x, 0.2)))
+    for pts, x in ((3.0, 0.2), (4.0, 0.6), (5.0, 0.7)):
+        observations.append(TrackObservation("person-1", "2", 0, pts, "person",
+                                              (0, 0, 1, 1), 0.9, None, (x, 0.3)))
+    for index in range(421):
+        pts = float(index) / 3.0
+        observations.append(TrackObservation("object-1", "3", 0, pts, "object",
+                                              (0, 0, 1, 1), 0.8, None, (0.2, 0.8)))
+
+    events = build_track_events("synthetic", observations, database, [restricted],
+                                stationary_epsilon=0.025, stationary_seconds=120.0)
+
+    entry = next(item for item in events if item["event_type"] == "zone_enter"
+                 and item["track_id"] == "person-1")
+    stationary = next(item for item in events if item["event_type"] == "stationary"
+                      and item["track_id"] == "object-1")
+    assert entry["zone"] == "restricted"
+    assert entry["t_start"] == 4.0
+    assert stationary["t_start"] == 0.0
+    assert stationary["t_end"] == pytest.approx(140.0)
     database.close()
 
 
@@ -406,7 +757,7 @@ def test_nvidia_video_key_selects_nvidia_hosted_vlm(monkeypatch):
     assert client.provider == "nvidia"
     assert client.api_key == "test-video-key"
     assert client.base_url == "https://integrate.api.nvidia.com/v1"
-    assert client.model == "meta/llama-3.2-11b-vision-instruct"
+    assert client.model == "nvidia/cosmos-reason2-8b"
 
 
 def test_nvidia_semantic_index_uses_matching_image_and_text_embeddings(monkeypatch, tmp_path):
@@ -418,8 +769,8 @@ def test_nvidia_semantic_index_uses_matching_image_and_text_embeddings(monkeypat
     index = ClipSemanticIndex(provider="nvidia")
     calls = []
 
-    def fake_embed(inputs):
-        calls.append(inputs)
+    def fake_embed(inputs, modality):
+        calls.append((inputs, modality))
         return [[1.0, 0.0] for _ in inputs]
 
     monkeypatch.setattr(index, "_embed_nvidia", fake_embed)
@@ -428,10 +779,34 @@ def test_nvidia_semantic_index_uses_matching_image_and_text_embeddings(monkeypat
     assert index.index_video("synthetic.mp4", "synthetic", database, tmp_path) == 1
     matches = index.ground_text("red object", database, "synthetic", threshold=0.0)
 
-    assert calls[0][0].startswith("data:image/jpeg;base64,")
-    assert calls[1] == ["red object"]
+    assert calls[0][0][0].startswith("data:image/jpeg;base64,")
+    assert calls[0][1] == "image"
+    assert calls[1] == (["red object"], "text")
     assert matches == [{"start": 2.5, "end": 3.5, "score": 1.0}]
     database.close()
+
+
+def test_nvidia_embedding_uses_verified_multimodal_model_and_roles(monkeypatch):
+    from types import SimpleNamespace
+    from semantic import ClipSemanticIndex
+
+    monkeypatch.delenv("TEMPORALVIDEO_EMBEDDING_MODEL", raising=False)
+    calls = []
+
+    class Embeddings:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(data=[SimpleNamespace(index=0, embedding=[1.0, 0.0])])
+
+    index = ClipSemanticIndex(provider="nvidia")
+    index._nvidia_client = SimpleNamespace(embeddings=Embeddings())
+
+    index._embed_nvidia(["image-data"], modality="image")
+    index._embed_nvidia(["query text"], modality="text")
+
+    assert calls[0]["model"] == "nvidia/llama-nemotron-embed-vl-1b-v2"
+    assert calls[0]["extra_body"] == {"modality": ["image"], "input_type": "passage", "truncate": "NONE"}
+    assert calls[1]["extra_body"] == {"modality": ["text"], "input_type": "query", "truncate": "NONE"}
 
 
 def test_hosted_model_json_parser_accepts_fenced_json():

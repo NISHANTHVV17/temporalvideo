@@ -107,8 +107,6 @@ class UltralyticsDetector:
 
 def make_detector(backend: str = "auto", model_path: str = "yolo11n.pt",
                   confidence: float = 0.25) -> Detector:
-    if backend == "auto" and not Path(model_path).exists():
-        return ContourFallbackDetector()
     if backend in {"auto", "ultralytics", "openvino"}:
         try:
             return UltralyticsDetector(model_path, confidence, openvino=(backend == "openvino"))
@@ -134,22 +132,71 @@ def _stabilized_point(box: tuple[float, float, float, float], matrix: np.ndarray
     return float(transformed[0] / width), float(transformed[1] / height)
 
 
+def _detection_center(detection: Detection | tuple[float, float, float, float]) -> tuple[float, float]:
+    if isinstance(detection, Detection):
+        x, y, w, h = detection.box
+    else:
+        x, y, w, h = detection
+    return (x + w / 2.0, y + h / 2.0)
+
+
+def _collapse_duplicate_detections(detections: list[Detection]) -> list[Detection]:
+    if len(detections) < 2:
+        return detections
+    merged: list[Detection] = []
+    for candidate in sorted(detections, key=lambda item: item.confidence, reverse=True):
+        kept = None
+        for index, existing in enumerate(merged):
+            same_box = _iou(existing.box, candidate.box) > 0.45 or (
+                math.dist(_detection_center(existing), _detection_center(candidate)) <= 0.12
+            )
+            if not same_box:
+                continue
+            if existing.class_name == "unknown" and candidate.class_name != "unknown":
+                merged[index] = Detection(candidate.box, candidate.class_name, max(existing.confidence, candidate.confidence),
+                                          candidate.embedding or existing.embedding,
+                                          candidate.external_track_id or existing.external_track_id)
+            elif candidate.class_name == "unknown":
+                merged[index] = Detection(existing.box, existing.class_name, max(existing.confidence, candidate.confidence),
+                                          existing.embedding or candidate.embedding,
+                                          existing.external_track_id or candidate.external_track_id)
+            else:
+                preferred = existing if existing.confidence >= candidate.confidence else candidate
+                union_box = (
+                    min(existing.box[0], candidate.box[0]),
+                    min(existing.box[1], candidate.box[1]),
+                    max(existing.box[0] + existing.box[2], candidate.box[0] + candidate.box[2]) - min(existing.box[0], candidate.box[0]),
+                    max(existing.box[1] + existing.box[3], candidate.box[1] + candidate.box[3]) - min(existing.box[1], candidate.box[1]),
+                )
+                merged[index] = Detection(union_box, preferred.class_name, max(existing.confidence, candidate.confidence),
+                                          preferred.embedding or existing.embedding or candidate.embedding,
+                                          preferred.external_track_id or existing.external_track_id or candidate.external_track_id)
+            kept = index
+            break
+        if kept is None:
+            merged.append(candidate)
+    return merged
+
+
 class MultiObjectTracker:
     def __init__(self, max_gap_seconds: float = 2.0):
         self.max_gap_seconds = max_gap_seconds
         self.active: dict[str, TrackObservation] = {}
         self.previous: dict[str, TrackObservation] = {}
+        self.external_to_track: dict[str, str] = {}
         self.next_id = 1
         self.shot_id: int | None = None
 
     def reset(self, shot_id: int) -> None:
         self.active.clear()
         self.previous.clear()
+        self.external_to_track.clear()
         self.shot_id = shot_id
 
     def update(self, sample: FrameSample, detections: list[Detection]) -> list[TrackObservation]:
         if self.shot_id != sample.shot_id:
             self.reset(sample.shot_id)
+        detections = _collapse_duplicate_detections(detections)
         height, width = sample.frame.shape[:2]
         track_ids = []
         track_states = []
@@ -175,15 +222,27 @@ class MultiObjectTracker:
                     scores[track_index, index] = overlap * 0.05 + appearance * 0.2 - distance
 
         assignment: dict[int, str] = {}
+        externally_matched_tracks: set[str] = set()
+        for detection_index, detection in enumerate(detections):
+            if detection.external_track_id is None:
+                continue
+            existing_id = self.external_to_track.get(detection.external_track_id)
+            if existing_id in track_ids and existing_id not in externally_matched_tracks:
+                assignment[detection_index] = existing_id
+                externally_matched_tracks.add(existing_id)
         if scores.size:
             track_indices, detection_indices = linear_sum_assignment(-scores)
             for track_index, detection_index in zip(track_indices, detection_indices):
-                if scores[track_index, detection_index] > -1e5:
+                if (scores[track_index, detection_index] > -1e5
+                        and detection_index not in assignment
+                        and track_ids[track_index] not in externally_matched_tracks):
                     assignment[detection_index] = track_ids[track_index]
 
         ambiguous_detections = set()
         if len(detections) < len(track_ids):
             for detection_index in range(len(detections)):
+                if detection_index in assignment:
+                    continue
                 valid_scores = np.sort(scores[:, detection_index][scores[:, detection_index] > -1e5])
                 if len(valid_scores) >= 2 and valid_scores[-1] - valid_scores[-2] < 0.04:
                     ambiguous_detections.add(detection_index)
@@ -210,8 +269,11 @@ class MultiObjectTracker:
                                            _stabilized_point(detection.box, sample.to_reference, width, height))
             self.active[track_id] = observation
             observations.append(observation)
+            if detection.external_track_id is not None:
+                self.external_to_track[detection.external_track_id] = track_id
+        retention_window = max(self.max_gap_seconds * 2.5, 1.5)
         self.active = {key: value for key, value in self.active.items()
-                       if sample.pts - value.pts <= self.max_gap_seconds}
+                       if sample.pts - value.pts <= retention_window}
         self.previous = {key: value for key, value in self.previous.items() if key in self.active}
         return observations
 

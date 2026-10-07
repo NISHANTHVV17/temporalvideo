@@ -11,6 +11,7 @@ pytest>=8.0
 
 # Optional model backends (install separately as needed):
 # ultralytics>=8.3
+# lap>=0.5.12
 # openvino>=2024.0
 # transformers>=4.40
 # torch>=2.2

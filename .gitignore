@@ -1,5 +1,6 @@
 .venv/
 .env
+yolo11n.pt
 __pycache__/
 .pytest_cache/
 .temporalvideo_cache/

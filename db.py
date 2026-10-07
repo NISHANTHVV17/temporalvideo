@@ -108,3 +108,47 @@ class EvidenceDB:
 
     def rows(self, sql: str, values: tuple[Any, ...] = ()) -> list[sqlite3.Row]:
         return list(self.connection.execute(sql, values))
+
+    def write_event_log(self, video_id: str) -> Path:
+        rows = self.rows("SELECT * FROM events WHERE video_id=? ORDER BY t_start, t_end", (video_id,))
+        log_path = self.path.with_suffix(".log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8") as handle:
+            handle.write(f"video_id={video_id}\n")
+            handle.write(f"database={self.path}\n")
+            handle.write(f"event_count={len(rows)}\n\n")
+            if not rows:
+                handle.write("No events recorded.\n")
+                return log_path
+            for row in rows:
+                start = float(row["t_start"])
+                end = float(row["t_end"])
+                handle.write(
+                    "event_id={event_id} | type={event_type} | class={class_name} | "
+                    "track_id={track_id} | t_start={t_start:.2f}s | t_end={t_end:.2f}s | "
+                    "duration={duration:.2f}s | zone={zone} | confidence={confidence:.2f} | meta={meta}\n".format(
+                        event_id=row["event_id"],
+                        event_type=row["event_type"],
+                        class_name=row["class"],
+                        track_id=row["track_id"] or "",
+                        t_start=start,
+                        t_end=end,
+                        duration=max(0.0, end - start),
+                        zone=row["zone"] or "",
+                        confidence=float(row["confidence"]),
+                        meta=row["meta_json"],
+                    )
+                )
+        return log_path
+
+    def write_summary_log(self, video_id: str, summary: list[dict[str, str]]) -> Path:
+        log_path = self.path.with_name(f"{video_id}.summary.txt")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8") as handle:
+            handle.write("Time\tEvent\n")
+            if not summary:
+                handle.write("No summary available.\n")
+                return log_path
+            for item in summary:
+                handle.write(f"{item.get('time', '')}\t{item.get('event', '')}\n")
+        return log_path

@@ -33,7 +33,7 @@ class ClipSemanticIndex:
         self.processor = self.model = None
         self._nvidia_client = None
 
-    def _embed_nvidia(self, inputs: list[str]) -> list[list[float]]:
+    def _embed_nvidia(self, inputs: list[str], modality: str) -> list[list[float]]:
         if self._nvidia_client is None:
             try:
                 from openai import OpenAI
@@ -47,11 +47,15 @@ class ClipSemanticIndex:
         try:
             response = self._nvidia_client.embeddings.create(
                 input=inputs,
-                model=os.getenv("TEMPORALVIDEO_EMBEDDING_MODEL", "nvidia/nvclip"),
-                encoding_format="float")
+                model=os.getenv("TEMPORALVIDEO_EMBEDDING_MODEL",
+                                "nvidia/llama-nemotron-embed-vl-1b-v2"),
+                encoding_format="float",
+                extra_body={"modality": [modality],
+                            "input_type": "passage" if modality == "image" else "query",
+                            "truncate": "NONE"})
         except Exception as exc:
             raise RuntimeError(
-                "NVIDIA NV-CLIP embedding failed; verify this API key has access to nvidia/nvclip") from exc
+                "NVIDIA multimodal embedding failed; verify this API key has access to the configured model") from exc
         return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
 
     @staticmethod
@@ -118,7 +122,7 @@ class ClipSemanticIndex:
         def flush_batch() -> None:
             if not records:
                 return
-            vectors = self._embed_nvidia([item[2] for item in records])
+            vectors = self._embed_nvidia([item[2] for item in records], modality="image")
             if len(vectors) != len(records):
                 raise RuntimeError("NVIDIA NV-CLIP returned an unexpected embedding count")
             embedded_records.extend((pts, image_path, vector)
@@ -134,13 +138,13 @@ class ClipSemanticIndex:
             while True:
                 ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if not ok:
-                    raise RuntimeError("Could not encode a frame for NVIDIA NV-CLIP")
+                    raise RuntimeError("Could not encode a frame for NVIDIA multimodal embeddings")
                 image_bytes = encoded.tobytes()
                 if len(image_bytes) <= 180_000:
                     break
                 height, width = image.shape[:2]
                 if min(height, width) <= 96:
-                    raise RuntimeError("Frame exceeds NVIDIA NV-CLIP's image size limit")
+                    raise RuntimeError("Frame exceeds NVIDIA's embedding image size limit")
                 image = cv2.resize(image, (max(1, round(width * 0.75)), max(1, round(height * 0.75))),
                                    interpolation=cv2.INTER_AREA)
                 quality = 55
@@ -166,7 +170,7 @@ class ClipSemanticIndex:
         if not rows:
             return []
         if self.provider == "nvidia":
-            text_vector = self._normalized(self._embed_nvidia([phrase])[0])
+            text_vector = self._normalized(self._embed_nvidia([phrase], modality="text")[0])
         else:
             if not self._load():
                 return []

@@ -34,15 +34,18 @@ def build_track_events(video_id: str, observations: list[TrackObservation], db: 
     events: list[dict[str, Any]] = []
     for track_id, points in grouped.items():
         points.sort(key=lambda point: point.pts)
-        first, last = points[0], points[-1]
-        events.append(_event(video_id, "appear", first.pts, first.pts, track_id, first.class_name, first.confidence))
-        events.append(_event(video_id, "disappear", last.pts, last.pts, track_id, last.class_name, last.confidence))
+        if len(points) > 1:
+            first, last = points[0], points[-1]
+            events.append(_event(video_id, "appear", first.pts, first.pts, track_id, first.class_name, first.confidence))
+            events.append(_event(video_id, "disappear", last.pts, last.pts, track_id, last.class_name, last.confidence))
         previous_moving = False
         for previous, current in zip(points, points[1:]):
             elapsed = current.pts - previous.pts
             distance = math.dist(previous.stabilized_center, current.stabilized_center)
-            moving = elapsed > 0 and distance / elapsed > stationary_epsilon
-            if moving != previous_moving and elapsed <= 2.0:
+            if elapsed <= 0:
+                continue
+            moving = distance / elapsed > stationary_epsilon
+            if moving != previous_moving and elapsed <= 2.0 and distance > 0.02:
                 events.append(_event(video_id, "motion_start" if moving else "motion_stop",
                                      current.pts, current.pts, track_id, current.class_name,
                                      current.confidence, meta={"stabilized_speed": distance / max(elapsed, 1e-6)}))

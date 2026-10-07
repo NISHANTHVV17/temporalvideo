@@ -37,6 +37,8 @@ audio:
 vlm:
   backend: auto
   local_model: Qwen/Qwen2.5-VL-3B-Instruct
+  summary_backend: twelvelabs
+  twelvelabs_model: pegasus1.6
 app:
   max_upload_seconds: 120
   max_upload_bytes: 1000000000
