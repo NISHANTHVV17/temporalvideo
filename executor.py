@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from pathlib import Path
@@ -35,12 +36,14 @@ EVENT_SYNONYMS = {
 class QueryExecutor:
     def __init__(self, db: EvidenceDB, video_id: str, video_path: str | Path,
                  duration: float, cache_dir: str | Path, reid_merges: list[Merge] | None = None,
-                 vlm: VLMClient | None = None, before_after_seconds: float = 10.0):
+                 vlm: VLMClient | None = None, before_after_seconds: float = 10.0,
+                 semantic_provider: str | None = None):
         self.db, self.video_id, self.video_path = db, video_id, str(video_path)
         self.duration, self.cache_dir = duration, Path(cache_dir)
         self.merges = reid_merges or []
         self.vlm = vlm if vlm is not None else choose_vlm()
         self.before_after_seconds = before_after_seconds
+        self.semantic_provider = semantic_provider
 
     def ask(self, question: str, plan: QueryPlan | None = None) -> Answer:
         plan = plan or parse_question(question, llm_client=self.vlm,
@@ -253,7 +256,7 @@ class QueryExecutor:
 
     def _clip_resolve(self, entities: list[EntitySpec]) -> list[TimedInterval]:
         try:
-            semantic = ClipSemanticIndex()
+            semantic = ClipSemanticIndex(provider=self.semantic_provider)
             result = []
             for entity in entities:
                 for item in semantic.ground_text(entity.phrase, self.db, self.video_id):
@@ -261,7 +264,8 @@ class QueryExecutor:
                                                 source="clip", confidence=min(0.69, max(0.36, item["score"])),
                                                 metadata={"similarity": item["score"]}))
             return result
-        except (RuntimeError, OSError, ValueError):
+        except (RuntimeError, OSError, ValueError) as exc:
+            logging.warning("Semantic grounding unavailable: %s", exc)
             return []
 
     def _open_vocab_resolve(self, question: str, entities: list[EntitySpec], rows) -> list[TimedInterval]:

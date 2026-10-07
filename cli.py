@@ -13,6 +13,7 @@ from typing import Any
 
 import cv2
 import yaml
+from dotenv import load_dotenv
 
 from audio import detect_audio_events
 from db import EvidenceDB
@@ -25,6 +26,7 @@ from zones import Line, Zone, load_lines, load_zones
 
 
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env", override=False)
 
 
 def read_config(path: str | Path | None = None) -> dict[str, Any]:
@@ -64,9 +66,17 @@ def index_video(video_path: str | Path, config_path: str | Path | None = None,
     db_path = _db_path(config, video_id)
     db = EvidenceDB(db_path)
     try:
+        semantic_config = config.get("semantic", {})
+        semantic_enabled = semantic_config.get("enabled", True)
+        from semantic import configured_embedding_provider
+        semantic_provider = (configured_embedding_provider(semantic_config.get("provider"))
+                     if semantic_enabled else "disabled")
         cached = db.rows("SELECT sha256,metadata_json FROM videos WHERE video_id=?", (video_id,))
-        complete = bool(cached and json.loads(cached[0]["metadata_json"] or "{}").get("complete"))
-        if cached and cached[0]["sha256"] == digest and complete and not force and not zone_path:
+        cached_metadata = json.loads(cached[0]["metadata_json"] or "{}") if cached else {}
+        complete = bool(cached_metadata.get("complete"))
+        provider_changed = semantic_enabled and cached_metadata.get("semantic_provider") != semantic_provider
+        if (cached and cached[0]["sha256"] == digest and complete and not force and not zone_path
+            and not provider_changed):
             print(f"Index cache hit: {video_id}")
             return video_id, db_path
 
@@ -178,20 +188,21 @@ def index_video(video_path: str | Path, config_path: str | Path | None = None,
             detect_audio_events(video_path, video_id, db, config["audio"].get("ffmpeg", "ffmpeg"))
         duration = info.duration or max_pts
         db.execute("UPDATE videos SET duration=? WHERE video_id=?", (duration, video_id))
-        if config["semantic"].get("enabled", True):
+        if semantic_enabled:
             try:
                 from semantic import ClipSemanticIndex
-                created = ClipSemanticIndex(config["semantic"]["model"], config["semantic"].get("device", "cpu"))
+                created = ClipSemanticIndex(semantic_config["model"], semantic_config.get("device", "cpu"),
+                                            semantic_config.get("provider"))
                 count = created.index_video(video_path, video_id, db, cache_root,
-                                            float(config["semantic"].get("embedding_fps", 1.0)))
+                                            float(semantic_config.get("embedding_fps", 1.0)))
                 if count:
                     print(f"Stored {count} semantic frame embeddings")
             except Exception as exc:
-                logging.info("Optional CLIP indexing skipped: %s", exc)
+                logging.warning("Optional semantic indexing skipped: %s", exc)
         _run_global_reid(db, video_id, config)
         db.execute("UPDATE videos SET metadata_json=? WHERE video_id=?",
                (json.dumps({"time_base": info.time_base, "audio_streams": info.audio_streams,
-                    "complete": True}), video_id))
+                    "complete": True, "semantic_provider": semantic_provider}), video_id))
         print(f"Indexed {sample_count} sampled frames to {db_path}")
         return video_id, db_path
     finally:
@@ -265,7 +276,8 @@ def ask_video(video_path: str | Path, question: str, config_path: str | Path | N
                          model_name=config.get("vlm", {}).get("local_model"))
         answer = QueryExecutor(db, video_id, video_path, float(row["duration"]),
                                _project_path(config["indexing"]["cache_dir"]), merges, vlm=vlm,
-                               before_after_seconds=float(config["query"]["before_after_seconds"])).ask(question)
+                               before_after_seconds=float(config["query"]["before_after_seconds"]),
+                               semantic_provider=config.get("semantic", {}).get("provider")).ask(question)
         return answer
     finally:
         db.close()

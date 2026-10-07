@@ -31,6 +31,13 @@ class MockedDetector:
         return [Detection((x, y, width, height), "test-shape", 0.99)]
 
 
+@pytest.fixture(autouse=True)
+def disable_remote_embeddings(monkeypatch):
+    monkeypatch.setenv("TEMPORALVIDEO_EMBEDDING_BACKEND", "local")
+    monkeypatch.delenv("NVIDIA_VIDEO_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
 def create_synthetic_video(directory: Path) -> tuple[Path, bool]:
     directory.mkdir(parents=True, exist_ok=True)
     silent = directory / "synthetic-silent.mp4"
@@ -399,7 +406,62 @@ def test_nvidia_video_key_selects_nvidia_hosted_vlm(monkeypatch):
     assert client.provider == "nvidia"
     assert client.api_key == "test-video-key"
     assert client.base_url == "https://integrate.api.nvidia.com/v1"
-    assert client.model == "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"
+    assert client.model == "meta/llama-3.2-11b-vision-instruct"
+
+
+def test_nvidia_semantic_index_uses_matching_image_and_text_embeddings(monkeypatch, tmp_path):
+    from semantic import ClipSemanticIndex
+
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    sample = FrameSample(pts=2.5, frame=frame, shot_id=0, to_reference=np.eye(3))
+    monkeypatch.setattr("semantic.iter_video", lambda *args, **kwargs: iter([sample]))
+    index = ClipSemanticIndex(provider="nvidia")
+    calls = []
+
+    def fake_embed(inputs):
+        calls.append(inputs)
+        return [[1.0, 0.0] for _ in inputs]
+
+    monkeypatch.setattr(index, "_embed_nvidia", fake_embed)
+    database = EvidenceDB(":memory:")
+
+    assert index.index_video("synthetic.mp4", "synthetic", database, tmp_path) == 1
+    matches = index.ground_text("red object", database, "synthetic", threshold=0.0)
+
+    assert calls[0][0].startswith("data:image/jpeg;base64,")
+    assert calls[1] == ["red object"]
+    assert matches == [{"start": 2.5, "end": 3.5, "score": 1.0}]
+    database.close()
+
+
+def test_hosted_model_json_parser_accepts_fenced_json():
+    from vlm_client import _parse_json_response
+
+    assert _parse_json_response("```json\n{\"answer\": \"person\"}\n```") == {"answer": "person"}
+
+
+def test_hosted_plan_normalizes_empty_nvidia_time_range(monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from vlm_client import HostedOpenAIClient
+
+    plan = {"intent": "find_event", "entities": [], "relations": [],
+            "filters": {"time_range": [None, None], "min_duration": None,
+                        "zone": None, "count_distinct": False},
+            "asks_causation": False, "preceding_seconds": 10}
+
+    class Completion:
+        def create(self, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(plan)))])
+
+    client = HostedOpenAIClient(provider="nvidia")
+    monkeypatch.setattr(client, "_client", lambda: SimpleNamespace(
+        chat=SimpleNamespace(completions=Completion())))
+
+    result = client.plan("What happened?")
+
+    assert result["filters"]["time_range"] is None
 
 
 def test_specific_sound_label_is_not_confident_from_onset_alone():

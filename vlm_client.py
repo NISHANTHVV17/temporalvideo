@@ -28,7 +28,7 @@ class HostedOpenAIClient:
         self.provider = provider or ("nvidia" if os.getenv("NVIDIA_VIDEO_API_KEY") else "openai")
         if self.provider == "nvidia":
             self.api_key = os.getenv("NVIDIA_VIDEO_API_KEY")
-            default_model = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"
+            default_model = "meta/llama-3.2-11b-vision-instruct"
             self.base_url = "https://integrate.api.nvidia.com/v1"
         else:
             self.api_key = os.getenv("OPENAI_API_KEY")
@@ -71,16 +71,40 @@ class HostedOpenAIClient:
                 "asks_causation": {"type": "boolean"}, "preceding_seconds": {"type": "number"}},
             "required": ["intent", "entities", "relations", "filters", "asks_causation", "preceding_seconds"],
             "additionalProperties": False}
+        system_prompt = ("Convert the video question into a generic evidence query plan. "
+                         "Do not answer the question. Separate entities on either side of temporal relations. "
+                         "Do not encode causal claims; mark asks_causation and request preceding events.")
+        if self.provider == "nvidia":
+            example = {"intent": "find_event", "entities": [{"phrase": "person", "kind": "person",
+                       "class_hint": "person"}], "relations": [],
+                       "filters": {"min_duration": None, "zone": None, "time_range": None,
+                                   "count_distinct": False},
+                       "asks_causation": False, "preceding_seconds": 10.0}
+            system_prompt += (" Return one populated JSON plan instance, not a JSON schema. Do not return "
+                              "keys named type or properties. Use exactly the top-level keys shown in this "
+                              "example and adapt the values to the question: "
+                              + json.dumps(example, separators=(",", ":"))
+                              + " Entity kind must be object, person, zone, sound, action, or state. "
+                              "Intent must be find_event, count, order, before_after, window_before, "
+                              "window_after, duration_filter, identify_track, describe, first, or last. "
+                              "Use null for an absent time_range; otherwise it must contain two numbers.")
+            response_format = {"type": "json_object"}
+        else:
+            response_format = {"type": "json_schema", "json_schema": {"name": "video_query_plan",
+                                                                          "strict": True, "schema": schema}}
         response = self._client().chat.completions.create(
             model=self.model,
-            messages=[{"role": "system", "content": "Convert the video question into a generic evidence query plan. "
-                      "Do not answer the question. Separate entities on either side of temporal relations. "
-                      "Do not encode causal claims; mark asks_causation and request preceding events."},
+            messages=[{"role": "system", "content": system_prompt},
                       {"role": "user", "content": question}],
-            response_format={"type": "json_schema", "json_schema": {"name": "video_query_plan",
-                                                                        "strict": True, "schema": schema}},
+            response_format=response_format,
             max_tokens=700)
-        return json.loads(response.choices[0].message.content or "{}")
+        result = _parse_json_response(response.choices[0].message.content or "{}")
+        filters = result.get("filters")
+        if isinstance(filters, dict):
+            time_range = filters.get("time_range")
+            if isinstance(time_range, list) and any(value is None for value in time_range):
+                filters["time_range"] = None
+        return result
 
     def answer(self, question: str, context: dict[str, Any], video_path: str,
                start: float, end: float) -> dict[str, Any]:
@@ -98,7 +122,11 @@ class HostedOpenAIClient:
             content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}})
         response = client.chat.completions.create(model=self.model, response_format={"type": "json_object"},
                                                    messages=[{"role": "user", "content": content}], max_tokens=700)
-        return json.loads(response.choices[0].message.content or "{}")
+        try:
+            return _parse_json_response(response.choices[0].message.content or "{}")
+        except (json.JSONDecodeError, ValueError):
+            return {"answer": response.choices[0].message.content or "",
+                    "timestamp_start": start, "timestamp_end": end, "confidence": 0.35}
 
     def _frames(self, video_path: str, start: float, end: float) -> list[tuple[float, str]]:
         import cv2
@@ -132,6 +160,16 @@ class HostedOpenAIClient:
         while sum(len(data) for _, data in frames) > self.max_payload_bytes and len(frames) > 2:
             frames = frames[::2]
         return frames[:8]
+
+
+def _parse_json_response(content: str) -> dict[str, Any]:
+    match = re.search(r"\{.*\}", content, re.S)
+    if match:
+        content = match.group(0)
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        raise ValueError("Hosted model response must be a JSON object")
+    return result
 
 
 class LocalQwenClient:

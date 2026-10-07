@@ -25,6 +25,7 @@ query:
 semantic:
   enabled: true
   model: openai/clip-vit-base-patch32
+  provider: auto
   embedding_fps: 1.0
   device: CPU
 verify:
